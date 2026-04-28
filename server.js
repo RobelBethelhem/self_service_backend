@@ -7,6 +7,8 @@ import userRoutes from "./routes/rms/users.js";
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
+import publicVerify from "./routes/rms/PublicVerify.js";
+
 
 import Candidate from "./routes/rms/Candidate.js";
 
@@ -851,11 +853,7 @@ console.log('Service Worker script fully loaded and ready!');
 
 
 
-
-
-
-
-
+ app.use("/zbss/api/public", publicVerify);
 
 
 
@@ -881,6 +879,8 @@ app.use("/zbss/api/users", userRoutes);
   app.use("/zbss/api/embassy", Embassy);
   app.use("/zbss/api/medical", MedicalRoutes);
   app.use("/zbss/api/medical-provider", MedicalProviderRoutes);
+
+ 
   
  
 
