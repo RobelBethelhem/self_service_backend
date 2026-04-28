@@ -20,6 +20,7 @@ import Guaranty from "./routes/rms/Guaranty.js";
 import pushNotificationRoutes from "./routes/rms/pushNotification.js";
 import MedicalRoutes from "./routes/rms/Medical.js"
 import MedicalProviderRoutes from "./routes/rms/MedicalProvider.js"
+import SalaryIncrement from "./routes/rms/SalaryIncrement.js"
 
 
 
@@ -879,6 +880,7 @@ app.use("/zbss/api/users", userRoutes);
   app.use("/zbss/api/embassy", Embassy);
   app.use("/zbss/api/medical", MedicalRoutes);
   app.use("/zbss/api/medical-provider", MedicalProviderRoutes);
+  app.use("/zbss/api/salary-increment", SalaryIncrement);
 
  
   

@@ -4,8 +4,15 @@ import Experiance from "../../models/rms/Experiance_Letter.js";
 import Embassy    from "../../models/rms/Letter_of_Embassy.js";
 import Guaranty   from "../../models/rms/Guaranty_Letter.js";
 import Supportive from "../../models/rms/Supportive_Letter.js";
+import SalaryIncrementLetter from "../../models/rms/SalaryIncrementLetter.js";
 
 const router = Router();
+
+// Salary increment letters share a single per-batch reference_number across many
+// employees, so the QR code on each printed letter encodes the letter's Mongo _id
+// instead. We detect that case by checking if the incoming ref is a 24-char hex
+// ObjectId and route the lookup accordingly.
+const isObjectId = (s) => typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
 
 router.get("/verify/*", async (req, res) => {
   try {
@@ -27,12 +34,38 @@ router.get("/verify/*", async (req, res) => {
     // Guaranty additionally has revoked_date
     const guarantyProjection = { ...baseProjection, revoked_date: 1 };
 
-    const [exp, emb, gua, sup] = await Promise.all([
+    const [exp, emb, gua, sup, sib] = await Promise.all([
       Experiance.findOne({ reference_number: ref }, baseProjection).lean(),
       Embassy.findOne({ reference_number: ref }, baseProjection).lean(),
       Guaranty.findOne({ reference_number: ref }, guarantyProjection).lean(),
       Supportive.findOne({ reference_number: ref }, baseProjection).lean(),
+      isObjectId(ref)
+        ? SalaryIncrementLetter.findById(ref).populate("import_batch_id").lean()
+        : Promise.resolve(null),
     ]);
+
+    // Salary increment letter: different state machine, different payload mapping.
+    if (sib) {
+      const employee_name = sib.employee_name || "";
+      const batchRef = sib.import_batch_id && sib.import_batch_id.reference_number
+        ? sib.import_batch_id.reference_number
+        : null;
+      return res.json({
+        valid: sib.status === "Committed",
+        status: sib.status,
+        letter_type: "SalaryIncrement",
+        reference_number: batchRef,
+        employee_name,
+        issued_date:
+          sib.status === "Committed" || sib.status === "Revoked"
+            ? sib.commitment_date || null
+            : null,
+        rejected_date: null,
+        revoked_date: sib.revoked_date || null,
+        fiscal_year: sib.fiscal_year,
+        category: sib.category,
+      });
+    }
 
     const hit = exp || emb || gua || sup;
     if (!hit) {
