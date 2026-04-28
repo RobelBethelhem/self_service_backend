@@ -65,15 +65,6 @@ const salaryIncrementImportSchema = new Schema({
         type: String,
         trim: true,
     },
-
-    // Set to true when this batch has been superseded (re-import with overwrite).
-    superseded: {
-        type: Boolean,
-        default: false,
-    },
-    superseded_at: {
-        type: Date,
-    },
 });
 
 const SalaryIncrementImport = mongoose.model("SalaryIncrementImport", salaryIncrementImportSchema);

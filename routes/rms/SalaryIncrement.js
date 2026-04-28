@@ -99,7 +99,10 @@ router.post(
             }
 
             // ---------- overwrite gating ----------
-            const existingBatch = await SalaryIncrementImport.findOne({ fiscal_year, superseded: { $ne: true } });
+            // Find ANY existing row for this fiscal_year (active or leftover from a prior
+            // failed import). The collection has a unique index on fiscal_year, so at most
+            // one such row exists — but we use findOne defensively.
+            const existingBatch = await SalaryIncrementImport.findOne({ fiscal_year });
             if (existingBatch && !overwrite) {
                 return res.status(409).json({
                     error: true,
@@ -174,13 +177,13 @@ router.post(
             }
 
             // ---------- overwrite cleanup ----------
-            // We delete the previous batch's letters (the unique index requires it) and mark
-            // the previous batch superseded so it survives as an audit record.
+            // Wipe every record for this fiscal year before inserting the new batch.
+            // We delete by fiscal_year (rather than batch _id) so that any leftover rows
+            // from a prior failed import are reclaimed — otherwise the unique index on
+            // SalaryIncrementImport.fiscal_year would reject the new insert.
             if (existingBatch && overwrite) {
-                await SalaryIncrementLetter.deleteMany({ import_batch_id: existingBatch._id });
-                existingBatch.superseded = true;
-                existingBatch.superseded_at = new Date();
-                await existingBatch.save();
+                await SalaryIncrementLetter.deleteMany({ fiscal_year });
+                await SalaryIncrementImport.deleteMany({ fiscal_year });
             }
 
             // ---------- create batch ----------
