@@ -376,6 +376,10 @@ router.post("/mark-printed", auth, roleCheck(["user", "admin"]), async (req, res
             return res.status(404).json({ error: true, message: "Letter not found" });
         }
 
+        // Owner-only. Admin prints from the list page are reference/archive copies
+        // and are intentionally NOT tracked here — the print count belongs to the
+        // user. Admin clients pass trackPrint={false} on the print component, so
+        // they don't reach this endpoint at all.
         if (String(letter.domain_user).toLowerCase() !== String(user.user).toLowerCase()) {
             return res
                 .status(403)
@@ -425,6 +429,26 @@ router.get("/list", auth, roleCheck(["admin"]), async (req, res) => {
                 $regex: escapeRegex(String(req.query.domain_user)),
                 $options: "i",
             };
+        }
+
+        // General search across domain_user, employee_name, first_name, AND the
+        // populated batch's reference_number. Lets admins find a row when they
+        // know any one of those identifiers.
+        if (req.query.q) {
+            const q = escapeRegex(String(req.query.q));
+            const matchingBatches = await SalaryIncrementImport.find(
+                { reference_number: { $regex: q, $options: "i" } },
+                { _id: 1 }
+            ).lean();
+            const orClauses = [
+                { domain_user: { $regex: q, $options: "i" } },
+                { employee_name: { $regex: q, $options: "i" } },
+                { first_name: { $regex: q, $options: "i" } },
+            ];
+            if (matchingBatches.length) {
+                orClauses.push({ import_batch_id: { $in: matchingBatches.map((b) => b._id) } });
+            }
+            filter.$or = orClauses;
         }
 
         const page = Math.max(1, Number(req.query.page) || 1);
