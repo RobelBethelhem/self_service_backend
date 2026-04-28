@@ -14,9 +14,13 @@ const router = Router();
 // ObjectId and route the lookup accordingly.
 const isObjectId = (s) => typeof s === "string" && /^[0-9a-fA-F]{24}$/.test(s);
 
-router.get("/verify/*", async (req, res) => {
+// The route accepts both styles of caller:
+//   GET /verify?ref=<x>   (frontend's VerifyLetter page calls this shape)
+//   GET /verify/<x>       (path-segment style; reserved for direct API consumers)
+// Query takes precedence; path param is the fallback.
+router.get(["/verify", "/verify/*"], async (req, res) => {
   try {
-    const ref = req.params[0];
+    const ref = (req.query && req.query.ref) || req.params[0];
     if (!ref) {
       return res.status(400).json({ valid: false, reason: "missing_ref" });
     }
