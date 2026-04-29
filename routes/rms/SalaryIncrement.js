@@ -1,10 +1,14 @@
 import { Router } from "express";
 import multer from "multer";
+import XLSX from "xlsx";
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import User from "../../models/rms/User.js";
 import SalaryIncrementLetter from "../../models/rms/SalaryIncrementLetter.js";
 import SalaryIncrementImport from "../../models/rms/SalaryIncrementImport.js";
+import SalaryIncrementCounter from "../../models/rms/SalaryIncrementCounter.js";
+import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
+import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
 import { parseSalaryWorkbook } from "../../utils/rms/salaryIncrementParser.js";
 
@@ -42,13 +46,20 @@ const CAT_KEY = {
 // ============================================================
 // POST /import — admin uploads the annual salary-increment workbook
 // ============================================================
+// Per-row decisions live in the SalaryCommitmentDecision collection (set
+// by users during the SalaryCommitmentPeriod *before* this import runs):
+//   - Decision Approved → row inserted with bonus_months as in the Excel.
+//   - Decision Rejected → row inserted with bonus_months overridden to 0.
+//   - No decision found → row skipped with reason "no_decision_recorded".
+// Letters are created with status="Committed" directly (no Imported→Committed
+// gate, since the user already decided).
+//
 // multipart/form-data fields:
 //   file:               .xlsx
-//   fiscal_year:        Number (e.g. 2025)
-//   reference_number:   String (admin types in the Board doc number)
-//   effective_date:     Date  (e.g. 2025-07-01)
-//   board_meeting_date: Date  (e.g. 2025-07-23)
-//   letter_date:        Date  (e.g. 2025-07-31)
+//   fiscal_year:        Number (e.g. 2026)
+//   effective_date:     Date  (e.g. 2026-07-01)
+//   board_meeting_date: Date  (e.g. 2026-07-23)
+//   letter_date:        Date  (e.g. 2026-07-31)
 //   overwrite:          "true" to replace an existing batch for the same year
 router.post(
     "/import",
@@ -73,11 +84,6 @@ router.post(
             const fiscal_year = Number(req.body.fiscal_year);
             if (!Number.isFinite(fiscal_year) || fiscal_year < 2000 || fiscal_year > 3000) {
                 return res.status(400).json({ error: true, message: "fiscal_year is required and must be a valid year" });
-            }
-
-            const reference_number = String(req.body.reference_number || "").trim();
-            if (!reference_number) {
-                return res.status(400).json({ error: true, message: "reference_number is required" });
             }
 
             const effective_date = parseDate(req.body.effective_date);
@@ -186,10 +192,17 @@ router.post(
                 await SalaryIncrementImport.deleteMany({ fiscal_year });
             }
 
+            // ---------- batch decision lookup ----------
+            // Pull every commitment decision for this fiscal_year up front so
+            // the per-row loop below is a Map lookup, not N round-trips.
+            const decisionDocs = await SalaryCommitmentDecision.find({ fiscal_year }).lean();
+            const decisionByLowerUser = new Map(
+                decisionDocs.map((d) => [String(d.domain_user).toLowerCase(), d])
+            );
+
             // ---------- create batch ----------
             const batch = await new SalaryIncrementImport({
                 fiscal_year,
-                reference_number,
                 effective_date,
                 board_meeting_date,
                 letter_date,
@@ -199,17 +212,45 @@ router.post(
             // ---------- save letters one-by-one (collect per-row errors without aborting) ----------
             const inserted = [];
             const insertErrors = [];
+            const skippedNoDecision = [];
             for (const row of validRows) {
                 const { sheet, excel_row, _user, ...fields } = row;
+
+                // Resolve the user's pre-import commitment decision for this fiscal year.
+                const dec = decisionByLowerUser.get(String(row.domain_user).toLowerCase());
+                if (!dec) {
+                    skippedNoDecision.push({
+                        sheet,
+                        category: row.category,
+                        excel_row,
+                        domain_user: row.domain_user,
+                        reason: "no_decision_recorded",
+                        details:
+                            "User did not record an Approve/Reject decision during the commitment period. Their row was skipped.",
+                    });
+                    continue;
+                }
+
+                // For users who rejected the commitment, blank out the bonus.
+                // Salary Only never had a bonus to begin with.
+                if (dec.decision === "Rejected" && row.category !== "Salary Only") {
+                    fields.bonus_months = 0;
+                    if (row.category === "Discipline") {
+                        fields.discipline_pct = 0;
+                    }
+                }
+
                 try {
                     const doc = await new SalaryIncrementLetter({
                         ...fields,
                         fiscal_year,
                         import_batch_id: batch._id,
                         imported_by: adminUser.user,
-                        status: "Imported",
+                        status: "Committed",
+                        commitment_decision: dec.decision,
+                        commitment_decided_at: dec.decided_at,
                     }).save();
-                    inserted.push({ doc, user: _user });
+                    inserted.push({ doc, user: _user, decision: dec.decision });
                 } catch (e) {
                     insertErrors.push({
                         sheet,
@@ -259,8 +300,10 @@ router.post(
                 message: `Imported ${inserted.length} salary increment letter(s) for fiscal year ${fiscal_year}`,
                 batch_id: batch._id,
                 fiscal_year,
-                reference_number,
                 total_imported: inserted.length,
+                approved_count: inserted.filter((i) => i.decision === "Approved").length,
+                rejected_count: inserted.filter((i) => i.decision === "Rejected").length,
+                skipped_no_decision: skippedNoDecision,
                 per_category: counts,
                 sheet_warnings,
                 row_errors: [...row_errors, ...insertErrors],
@@ -276,7 +319,238 @@ router.post(
 );
 
 // ============================================================
-// GET /my — caller's own salary increment letters (newest first)
+// POST /period — admin upserts the commitment window for a fiscal year.
+// Body: { fiscal_year, start_date, end_date, notes? }
+// If the period already exists for the FY, dates are updated in place
+// (this is how admins extend the deadline).
+// ============================================================
+router.post("/period", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const fiscal_year = Number(req.body.fiscal_year);
+        if (!Number.isFinite(fiscal_year) || fiscal_year < 2000 || fiscal_year > 3000) {
+            return res
+                .status(400)
+                .json({ error: true, message: "fiscal_year is required and must be a valid year" });
+        }
+
+        const start_date = parseDate(req.body.start_date);
+        const end_date = parseDate(req.body.end_date);
+        if (!start_date || !end_date) {
+            return res.status(400).json({
+                error: true,
+                message: "start_date and end_date are required (YYYY-MM-DD)",
+            });
+        }
+        if (start_date >= end_date) {
+            return res
+                .status(400)
+                .json({ error: true, message: "end_date must be after start_date" });
+        }
+
+        const adminUser = await User.findOne({ _id: req.user._id });
+        if (!adminUser) {
+            return res.status(400).json({ error: true, message: "The requester cannot be found" });
+        }
+
+        const notes = String(req.body.notes || "").trim();
+
+        const existing = await SalaryCommitmentPeriod.findOne({ fiscal_year });
+        let period;
+        if (existing) {
+            existing.start_date = start_date;
+            existing.end_date = end_date;
+            existing.notes = notes || existing.notes;
+            existing.updated_by = adminUser.user;
+            existing.updated_at = new Date();
+            period = await existing.save();
+        } else {
+            period = await new SalaryCommitmentPeriod({
+                fiscal_year,
+                start_date,
+                end_date,
+                notes: notes || undefined,
+                created_by: adminUser.user,
+            }).save();
+        }
+
+        return res.json({ error: false, period });
+    } catch (e) {
+        console.error("Salary /period POST error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// GET /period — anyone authenticated. Returns the most recent period
+// (or one for a specific fiscal_year via query param).
+// ============================================================
+router.get("/period", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const query = {};
+        if (req.query.fiscal_year) {
+            const fy = Number(req.query.fiscal_year);
+            if (Number.isFinite(fy)) query.fiscal_year = fy;
+        }
+        const period = await SalaryCommitmentPeriod.findOne(query)
+            .sort({ fiscal_year: -1 })
+            .lean();
+        return res.json({ error: false, period });
+    } catch (e) {
+        console.error("Salary /period GET error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// POST /decision — user records or flips their commitment decision.
+// Body: { fiscal_year, decision: "Approved" | "Rejected" }
+// Refused once the period for that FY is closed (server-authoritative
+// time check). Every flip is appended to decision_history for audit.
+// ============================================================
+router.post("/decision", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const decision = String(req.body.decision || "").trim();
+        if (!["Approved", "Rejected"].includes(decision)) {
+            return res
+                .status(400)
+                .json({ error: true, message: "decision must be 'Approved' or 'Rejected'" });
+        }
+        const fiscal_year = Number(req.body.fiscal_year);
+        if (!Number.isFinite(fiscal_year)) {
+            return res.status(400).json({ error: true, message: "fiscal_year is required" });
+        }
+
+        const user = await User.findOne({ _id: req.user._id });
+        if (!user) {
+            return res.status(400).json({ error: true, message: "The requester cannot be found" });
+        }
+
+        const period = await SalaryCommitmentPeriod.findOne({ fiscal_year });
+        if (!period) {
+            return res.status(400).json({
+                error: true,
+                message: `No commitment period configured for FY ${fiscal_year}`,
+            });
+        }
+
+        const now = new Date();
+        if (now < period.start_date) {
+            return res
+                .status(400)
+                .json({ error: true, message: "The commitment period has not started yet." });
+        }
+        if (now > period.end_date) {
+            return res.status(400).json({
+                error: true,
+                message: "The commitment period has ended. Decisions are now final.",
+            });
+        }
+
+        const xff = req.headers["x-forwarded-for"];
+        const clientIp = (xff ? String(xff).split(",")[0].trim() : null) || req.ip || null;
+        const ua = String(req.headers["user-agent"] || "").slice(0, 500);
+
+        const historyEntry = { decision, at: now, user_agent: ua, ip: clientIp };
+
+        const existing = await SalaryCommitmentDecision.findOne({
+            fiscal_year,
+            domain_user: user.user,
+        });
+        let saved;
+        if (existing) {
+            existing.decision = decision;
+            existing.decided_at = now;
+            existing.user_agent = ua;
+            existing.ip = clientIp;
+            existing.decision_history.push(historyEntry);
+            saved = await existing.save();
+        } else {
+            saved = await new SalaryCommitmentDecision({
+                fiscal_year,
+                domain_user: user.user,
+                decision,
+                decided_at: now,
+                user_agent: ua,
+                ip: clientIp,
+                decision_history: [historyEntry],
+            }).save();
+        }
+
+        return res.json({
+            error: false,
+            decision: {
+                fiscal_year: saved.fiscal_year,
+                decision: saved.decision,
+                decided_at: saved.decided_at,
+                flips: saved.decision_history.length,
+            },
+        });
+    } catch (e) {
+        console.error("Salary /decision POST error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// GET /decisions/export?fiscal_year=YYYY — admin-only xlsx download.
+// Used after the period closes so HR can prepare the import workbook.
+// Columns: Domain Name, Employee Name, Decision, Decided At, Flips.
+// ============================================================
+router.get("/decisions/export", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const fy = Number(req.query.fiscal_year);
+        if (!Number.isFinite(fy)) {
+            return res
+                .status(400)
+                .json({ error: true, message: "fiscal_year query param is required" });
+        }
+
+        const decisions = await SalaryCommitmentDecision.find({ fiscal_year: fy }).lean();
+
+        const usernames = decisions.map((d) => d.domain_user);
+        const users = usernames.length ? await User.find({ user: { $in: usernames } }).lean() : [];
+        const nameByLowerUser = new Map();
+        for (const u of users) {
+            nameByLowerUser.set(
+                String(u.user).toLowerCase(),
+                `${u.first_name || ""} ${u.last_name || ""}`.trim()
+            );
+        }
+
+        const aoa = [["Domain Name", "Employee Name", "Decision", "Decided At", "Flips"]];
+        for (const d of decisions) {
+            const name = nameByLowerUser.get(String(d.domain_user).toLowerCase()) || "";
+            aoa.push([
+                d.domain_user,
+                name,
+                d.decision,
+                d.decided_at ? new Date(d.decided_at).toISOString() : "",
+                Array.isArray(d.decision_history) ? d.decision_history.length : 0,
+            ]);
+        }
+
+        const ws = XLSX.utils.aoa_to_sheet(aoa);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, `Decisions FY ${fy}`);
+        const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+        const filename = `salary-decisions-fy-${fy}.xlsx`;
+        res.setHeader(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        return res.send(buf);
+    } catch (e) {
+        console.error("Salary /decisions/export error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// GET /my — caller's own salary increment letters + the most recent
+// commitment period and their decision for it (single call so the user
+// page can render every state without chaining requests).
 // ============================================================
 router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
     try {
@@ -285,13 +559,53 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
             return res.status(400).json({ error: true, message: "The requester cannot be found" });
         }
 
-        const letters = await SalaryIncrementLetter.find({
-            domain_user: { $regex: "^" + escapeRegex(user.user) + "$", $options: "i" },
-        })
-            .populate("import_batch_id")
-            .sort({ fiscal_year: -1, TimeStamp: -1 });
+        const userRegex = new RegExp("^" + escapeRegex(user.user) + "$", "i");
 
-        return res.json({ error: false, letters });
+        const [letters, period] = await Promise.all([
+            SalaryIncrementLetter.find({ domain_user: userRegex })
+                .populate("import_batch_id")
+                .sort({ fiscal_year: -1, TimeStamp: -1 }),
+            SalaryCommitmentPeriod.findOne({}).sort({ fiscal_year: -1 }).lean(),
+        ]);
+
+        let decision = null;
+        if (period) {
+            decision = await SalaryCommitmentDecision.findOne({
+                fiscal_year: period.fiscal_year,
+                domain_user: userRegex,
+            }).lean();
+        }
+
+        const now = new Date();
+        const periodOut = period
+            ? {
+                  fiscal_year: period.fiscal_year,
+                  start_date: period.start_date,
+                  end_date: period.end_date,
+                  notes: period.notes || null,
+                  is_open: now >= period.start_date && now <= period.end_date,
+                  has_started: now >= period.start_date,
+                  has_ended: now > period.end_date,
+              }
+            : null;
+
+        const decisionOut = decision
+            ? {
+                  fiscal_year: decision.fiscal_year,
+                  decision: decision.decision,
+                  decided_at: decision.decided_at,
+                  flips: Array.isArray(decision.decision_history)
+                      ? decision.decision_history.length
+                      : 0,
+              }
+            : null;
+
+        return res.json({
+            error: false,
+            letters,
+            period: periodOut,
+            decision: decisionOut,
+        });
     } catch (e) {
         console.error("Salary /my error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
@@ -393,6 +707,14 @@ router.post("/mark-printed", auth, roleCheck(["user", "admin"]), async (req, res
             });
         }
 
+        // Assign the system reference number on first print (any caller).
+        // Subsequent prints reuse the same value, so the QR code, the
+        // printed reference, and the public verify page all line up.
+        if (!letter.reference_number) {
+            letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
+            letter.reference_number_assigned_at = new Date();
+        }
+
         const now = new Date();
         letter.printed_count = (letter.printed_count || 0) + 1;
         letter.last_printed_at = now;
@@ -401,12 +723,54 @@ router.post("/mark-printed", auth, roleCheck(["user", "admin"]), async (req, res
 
         return res.json({
             error: false,
+            reference_number: letter.reference_number,
             printed_count: letter.printed_count,
             first_printed_at: letter.first_printed_at,
             last_printed_at: letter.last_printed_at,
         });
     } catch (e) {
         console.error("Salary /mark-printed error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// POST /admin-prepare-print — admin's reference-copy print pipeline
+// Body: { id }
+// Ensures the letter has a system reference_number (assigning lazily if
+// missing) but does NOT touch printed_count/first_/last_printed_at.
+// Used by the admin list-page modal so HR can produce archive copies.
+// ============================================================
+router.post("/admin-prepare-print", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const { id } = req.body || {};
+        if (!id) {
+            return res.status(400).json({ error: true, message: "Letter id is required" });
+        }
+
+        const letter = await SalaryIncrementLetter.findById(id);
+        if (!letter) {
+            return res.status(404).json({ error: true, message: "Letter not found" });
+        }
+        if (letter.status !== "Committed") {
+            return res.status(400).json({
+                error: true,
+                message: `Letter must be in "Committed" status to be printed (current: "${letter.status}")`,
+            });
+        }
+
+        if (!letter.reference_number) {
+            letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
+            letter.reference_number_assigned_at = new Date();
+            await letter.save();
+        }
+
+        return res.json({
+            error: false,
+            reference_number: letter.reference_number,
+        });
+    } catch (e) {
+        console.error("Salary /admin-prepare-print error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
     }
 });

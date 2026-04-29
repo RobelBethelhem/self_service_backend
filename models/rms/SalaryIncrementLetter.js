@@ -88,11 +88,31 @@ const salaryIncrementLetterSchema = new Schema({
     },
 
     // ============ workflow state ============
+    // "Imported" is retained for backward compatibility with any rows created
+    // before the pre-import commitment workflow shipped. New rows go straight
+    // to "Committed" because the user's commitment decision is recorded BEFORE
+    // the Excel is uploaded — see SalaryCommitmentDecision.
     status: {
         type: String,
         enum: ["Imported", "Committed", "Revoked"],
-        default: "Imported",
+        default: "Committed",
     },
+
+    // The user's pre-import decision, copied onto the letter at import time.
+    // Drives whether the bonus paragraph renders (Approved) or is suppressed
+    // because bonus_months was forced to 0 (Rejected).
+    commitment_decision: {
+        type: String,
+        enum: ["Approved", "Rejected"],
+    },
+    commitment_decided_at: {
+        type: Date,
+    },
+
+    // Legacy fields from the pre-redesign per-letter commitment flow. Kept
+    // for backward compatibility with any docs created under that schema.
+    // New imports do not populate these — the decision lives in
+    // SalaryCommitmentDecision instead.
     commitment_agreed: {
         type: Boolean,
         default: false,
@@ -142,6 +162,18 @@ const salaryIncrementLetterSchema = new Schema({
     TimeStamp: {
         type: Date,
         default: Date.now,
+    },
+
+    // System-generated reference number, assigned lazily on first print
+    // (whether by the owner via /mark-printed or by an admin via
+    // /admin-prepare-print). Once set, it never changes — subsequent prints
+    // re-use the same value. Format: ZB/HC/INC/00001/2026
+    reference_number: {
+        type: String,
+        trim: true,
+    },
+    reference_number_assigned_at: {
+        type: Date,
     },
 
     // ============ revoke ============

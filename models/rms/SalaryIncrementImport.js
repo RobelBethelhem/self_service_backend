@@ -19,15 +19,6 @@ const salaryIncrementImportSchema = new Schema({
         unique: true,
     },
 
-    // The Board's decision-document reference — admin types this in at import time.
-    // Same value renders as "Ref. No." on every letter in this batch.
-    // Example: "ZB/HC/2198/2025"
-    reference_number: {
-        type: String,
-        required: true,
-        trim: true,
-    },
-
     // The three dates that render verbatim in every letter for this batch.
     effective_date: {
         type: Date,
