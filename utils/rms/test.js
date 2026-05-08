@@ -303,4 +303,35 @@ ORDER BY
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment };
+// Lighter-weight HRIS lookup that returns just the employee's canonical
+// name parts and EmployeeId, without joining EmployeeExperience. Used by
+// the salary-increment agreement modal where we only need the identity —
+// employees who don't (yet) have an EmployeeExperience row would be
+// invisible to test() but visible here.
+const getEmployeeIdentity = async (username) => {
+    try {
+        await sql.connect(dbConfig);
+        const request = new sql.Request();
+
+        const query = `
+            SELECT TOP 1
+                a.[Name]       AS Name,
+                a.[FName]      AS FName,
+                a.[GFName]     AS GFName,
+                a.[EmployeeId] AS EmployeeId
+            FROM EmployeeDetail a
+            JOIN UserProfile  d ON d.UserId = a.UserId
+            WHERE d.UserName = @username
+        `;
+        request.input('username', sql.NVarChar, username);
+        const result = await request.query(query);
+        return result.recordset[0] || null;
+    } catch (e) {
+        console.error("Error fetching employee identity:", e.message);
+        return null;
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity };

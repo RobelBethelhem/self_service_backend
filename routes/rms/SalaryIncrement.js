@@ -11,7 +11,7 @@ import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
 import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
 import { parseSalaryWorkbook } from "../../utils/rms/salaryIncrementParser.js";
-import { test } from "../../utils/rms/test.js";
+import { getEmployeeIdentity } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -583,15 +583,17 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
 
         const userRegex = new RegExp("^" + escapeRegex(user.user) + "$", "i");
 
-        // HRIS lookup is non-fatal — if the SQL Server can't be reached or has
-        // no row for this user, we fall back to the User collection's name fields
-        // so the agreement can still render with a reasonable identity.
-        const [letters, period, hrInfo] = await Promise.all([
+        // HRIS identity lookup is non-fatal — if SQL Server is unreachable
+        // or has no row for this user we fall back to the Mongo User row so
+        // the agreement can still render. getEmployeeIdentity uses a simpler
+        // query than test() (no EmployeeExperience join) so it returns data
+        // for staff who haven't been assigned an experience row yet.
+        const [letters, period, hrIdentity] = await Promise.all([
             SalaryIncrementLetter.find({ domain_user: userRegex })
                 .populate("import_batch_id")
                 .sort({ fiscal_year: -1, TimeStamp: -1 }),
             SalaryCommitmentPeriod.findOne({}).sort({ fiscal_year: -1 }).lean(),
-            test(user.user).catch(() => null),
+            getEmployeeIdentity(user.user).catch(() => null),
         ]);
 
         let decision = null;
@@ -603,9 +605,17 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
         }
 
         const now = new Date();
+        // Format the Ethiopian fiscal-year label "YYYY/YY" once on the server
+        // so every consumer (web modal, PDF, mobile) shows the same string.
+        // FY 2026 → "2025/26", FY 2027 → "2026/27", etc.
+        const fyLabel = period
+            ? `${period.fiscal_year - 1}/${(period.fiscal_year % 100).toString().padStart(2, "0")}`
+            : null;
+
         const periodOut = period
             ? {
                   fiscal_year: period.fiscal_year,
+                  fiscal_year_label: fyLabel,
                   start_date: period.start_date,
                   end_date: period.end_date,
                   notes: period.notes || null,
@@ -627,23 +637,27 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
             : null;
 
         // Derive the employee's display identity for the agreement modal:
-        // prefer the HRIS canonical name (Name / FName / GFName), fall back to
-        // whatever the Mongo User row carries.
+        // prefer the HRIS canonical name (Name / FName / GFName) and HRIS
+        // EmployeeId. Mongo User row is a non-blocking fallback if HRIS is
+        // unreachable.
         let employeeInfo = {
             first_name: user.first_name || "",
             middle_name: "",
             last_name: user.last_name || "",
             employee_id: user.employee_id || "",
             domain_user: user.user,
+            source: "user_collection",
         };
-        if (Array.isArray(hrInfo) && hrInfo.length > 0) {
-            const hr = hrInfo[0];
+        if (hrIdentity) {
             employeeInfo = {
-                first_name: hr.Name || employeeInfo.first_name,
-                middle_name: hr.FName || employeeInfo.middle_name,
-                last_name: hr.GFName || employeeInfo.last_name,
-                employee_id: hr.EmployeeId || employeeInfo.employee_id,
+                first_name: hrIdentity.Name || employeeInfo.first_name,
+                middle_name: hrIdentity.FName || employeeInfo.middle_name,
+                last_name: hrIdentity.GFName || employeeInfo.last_name,
+                employee_id: hrIdentity.EmployeeId
+                    ? String(hrIdentity.EmployeeId)
+                    : employeeInfo.employee_id,
                 domain_user: user.user,
+                source: "hris",
             };
         }
 
