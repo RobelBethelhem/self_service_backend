@@ -506,6 +506,13 @@ router.get("/decisions/export", auth, roleCheck(["admin"]), async (req, res) => 
         }
 
         const decisions = await SalaryCommitmentDecision.find({ fiscal_year: fy }).lean();
+        // Sort alphabetically by domain user (case-insensitive) — HR scans the
+        // export by name when building the import workbook.
+        decisions.sort((a, b) =>
+            String(a.domain_user || "").localeCompare(String(b.domain_user || ""), "en", {
+                sensitivity: "base",
+            })
+        );
 
         const usernames = decisions.map((d) => d.domain_user);
         const users = usernames.length ? await User.find({ user: { $in: usernames } }).lean() : [];
@@ -517,21 +524,35 @@ router.get("/decisions/export", auth, roleCheck(["admin"]), async (req, res) => 
             );
         }
 
-        const aoa = [["Domain Name", "Employee Name", "Decision", "Decided At", "Flips"]];
+        // Two-sheet workbook: "Approved" first, "Rejected" second. Each sheet
+        // gets the same column shape so HR can copy rows between them or out
+        // into the salary-increment import workbook.
+        const headers = [
+            "Domain Name",
+            "Employee Name",
+            "Decision",
+            "Decided At",
+            "Flips",
+        ];
+        const approvedAoa = [headers];
+        const rejectedAoa = [headers];
+
         for (const d of decisions) {
             const name = nameByLowerUser.get(String(d.domain_user).toLowerCase()) || "";
-            aoa.push([
+            const row = [
                 d.domain_user,
                 name,
                 d.decision,
                 d.decided_at ? new Date(d.decided_at).toISOString() : "",
                 Array.isArray(d.decision_history) ? d.decision_history.length : 0,
-            ]);
+            ];
+            if (d.decision === "Approved") approvedAoa.push(row);
+            else if (d.decision === "Rejected") rejectedAoa.push(row);
         }
 
-        const ws = XLSX.utils.aoa_to_sheet(aoa);
         const wb = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(wb, ws, `Decisions FY ${fy}`);
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(approvedAoa), "Approved");
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rejectedAoa), "Rejected");
         const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
         const filename = `salary-decisions-fy-${fy}.xlsx`;
@@ -831,6 +852,118 @@ router.get("/list", auth, roleCheck(["admin"]), async (req, res) => {
         return res.json({ data, meta: { totalRowCount } });
     } catch (e) {
         console.error("Salary /list error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// GET /analytics — admin-only summary of the salary letter program.
+// Optional ?fiscal_year filter; otherwise returns aggregates across years.
+// ============================================================
+router.get("/analytics", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const fy = Number(req.query.fiscal_year);
+        const baseFilter = Number.isFinite(fy) ? { fiscal_year: fy } : {};
+
+        const [
+            total,
+            byStatusAgg,
+            byCategoryAgg,
+            byDecisionAgg,
+            byFiscalYearAgg,
+            printedAgg,
+            printNeverCount,
+            decisionsTotal,
+            decisionsApproved,
+            decisionsRejected,
+            decisionFlipsAgg,
+        ] = await Promise.all([
+            SalaryIncrementLetter.countDocuments(baseFilter),
+            SalaryIncrementLetter.aggregate([
+                { $match: baseFilter },
+                { $group: { _id: "$status", count: { $sum: 1 } } },
+            ]),
+            SalaryIncrementLetter.aggregate([
+                { $match: baseFilter },
+                { $group: { _id: "$category", count: { $sum: 1 } } },
+            ]),
+            SalaryIncrementLetter.aggregate([
+                { $match: baseFilter },
+                { $group: { _id: "$commitment_decision", count: { $sum: 1 } } },
+            ]),
+            SalaryIncrementLetter.aggregate([
+                { $match: {} },
+                { $group: { _id: "$fiscal_year", count: { $sum: 1 } } },
+                { $sort: { _id: -1 } },
+            ]),
+            SalaryIncrementLetter.aggregate([
+                { $match: { ...baseFilter, printed_count: { $gt: 0 } } },
+                {
+                    $group: {
+                        _id: null,
+                        users_printed: { $sum: 1 },
+                        total_print_events: { $sum: "$printed_count" },
+                    },
+                },
+            ]),
+            SalaryIncrementLetter.countDocuments({
+                ...baseFilter,
+                $or: [{ printed_count: 0 }, { printed_count: { $exists: false } }],
+            }),
+            SalaryCommitmentDecision.countDocuments(
+                Number.isFinite(fy) ? { fiscal_year: fy } : {}
+            ),
+            SalaryCommitmentDecision.countDocuments({
+                ...(Number.isFinite(fy) ? { fiscal_year: fy } : {}),
+                decision: "Approved",
+            }),
+            SalaryCommitmentDecision.countDocuments({
+                ...(Number.isFinite(fy) ? { fiscal_year: fy } : {}),
+                decision: "Rejected",
+            }),
+            SalaryCommitmentDecision.aggregate([
+                { $match: Number.isFinite(fy) ? { fiscal_year: fy } : {} },
+                {
+                    $project: {
+                        flips: { $size: { $ifNull: ["$decision_history", []] } },
+                    },
+                },
+                { $match: { flips: { $gt: 1 } } },
+                { $count: "users_who_flipped" },
+            ]),
+        ]);
+
+        const toMap = (arr) =>
+            arr.reduce((acc, r) => {
+                acc[r._id || "Unknown"] = r.count;
+                return acc;
+            }, {});
+
+        const printed = printedAgg[0] || { users_printed: 0, total_print_events: 0 };
+
+        return res.json({
+            error: false,
+            fiscal_year: Number.isFinite(fy) ? fy : null,
+            total_letters: total,
+            by_status: toMap(byStatusAgg),
+            by_category: toMap(byCategoryAgg),
+            by_decision: toMap(byDecisionAgg),
+            by_fiscal_year: toMap(byFiscalYearAgg),
+            printing: {
+                users_printed: printed.users_printed,
+                users_never_printed: printNeverCount,
+                total_print_events: printed.total_print_events,
+            },
+            commitments: {
+                total_decisions: decisionsTotal,
+                approved: decisionsApproved,
+                rejected: decisionsRejected,
+                users_who_flipped:
+                    (decisionFlipsAgg[0] && decisionFlipsAgg[0].users_who_flipped) || 0,
+            },
+        });
+    } catch (e) {
+        console.error("Salary /analytics error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
     }
 });
