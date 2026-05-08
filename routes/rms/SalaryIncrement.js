@@ -11,6 +11,7 @@ import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
 import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
 import { parseSalaryWorkbook } from "../../utils/rms/salaryIncrementParser.js";
+import { test } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -582,11 +583,15 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
 
         const userRegex = new RegExp("^" + escapeRegex(user.user) + "$", "i");
 
-        const [letters, period] = await Promise.all([
+        // HRIS lookup is non-fatal — if the SQL Server can't be reached or has
+        // no row for this user, we fall back to the User collection's name fields
+        // so the agreement can still render with a reasonable identity.
+        const [letters, period, hrInfo] = await Promise.all([
             SalaryIncrementLetter.find({ domain_user: userRegex })
                 .populate("import_batch_id")
                 .sort({ fiscal_year: -1, TimeStamp: -1 }),
             SalaryCommitmentPeriod.findOne({}).sort({ fiscal_year: -1 }).lean(),
+            test(user.user).catch(() => null),
         ]);
 
         let decision = null;
@@ -621,11 +626,33 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
               }
             : null;
 
+        // Derive the employee's display identity for the agreement modal:
+        // prefer the HRIS canonical name (Name / FName / GFName), fall back to
+        // whatever the Mongo User row carries.
+        let employeeInfo = {
+            first_name: user.first_name || "",
+            middle_name: "",
+            last_name: user.last_name || "",
+            employee_id: user.employee_id || "",
+            domain_user: user.user,
+        };
+        if (Array.isArray(hrInfo) && hrInfo.length > 0) {
+            const hr = hrInfo[0];
+            employeeInfo = {
+                first_name: hr.Name || employeeInfo.first_name,
+                middle_name: hr.FName || employeeInfo.middle_name,
+                last_name: hr.GFName || employeeInfo.last_name,
+                employee_id: hr.EmployeeId || employeeInfo.employee_id,
+                domain_user: user.user,
+            };
+        }
+
         return res.json({
             error: false,
             letters,
             period: periodOut,
             decision: decisionOut,
+            employee_info: employeeInfo,
         });
     } catch (e) {
         console.error("Salary /my error:", e);
