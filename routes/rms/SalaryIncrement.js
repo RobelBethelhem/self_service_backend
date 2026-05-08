@@ -612,10 +612,18 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
             ? `${period.fiscal_year - 1}/${(period.fiscal_year % 100).toString().padStart(2, "0")}`
             : null;
 
+        // The Ethiopian fiscal year runs July → June, so the obligatory
+        // service period for FY <n> begins on July 1 of <n - 1>. Used as
+        // the "Effective Date" line on the agreement.
+        const effectiveDate = period
+            ? new Date(Date.UTC(period.fiscal_year - 1, 6, 1, 0, 0, 0)).toISOString()
+            : null;
+
         const periodOut = period
             ? {
                   fiscal_year: period.fiscal_year,
                   fiscal_year_label: fyLabel,
+                  effective_date: effectiveDate,
                   start_date: period.start_date,
                   end_date: period.end_date,
                   notes: period.notes || null,
