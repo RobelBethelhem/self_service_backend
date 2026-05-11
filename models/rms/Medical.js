@@ -45,12 +45,29 @@ const medicalSchema = new Schema({
         trim: true,
     },
 
-    employee_description: { 
+    employee_description: {
         type: String,
         trim: true,
     },
 
-    employee_id_no: { 
+    // Canonical employee name parts, sourced from HRIS at submission /
+    // approval time. Used by the Medical Slip render instead of splitting
+    // domain_user, which mis-handles AD usernames where the second token
+    // is the grandfather name (e.g. Robel.Bogale) rather than the father.
+    employee_first_name: {
+        type: String,
+        trim: true,
+    },
+    employee_middle_name: {
+        type: String,
+        trim: true,
+    },
+    employee_last_name: {
+        type: String,
+        trim: true,
+    },
+
+    employee_id_no: {
         type: String,
         required: true,
         trim: true,

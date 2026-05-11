@@ -7,7 +7,7 @@ import Medical from "../../models/rms/Medical.js";
 import { medical_BodyValidation } from "../../utils/rms/serveService.js";
 import MedicalCounter from "../../models/rms/MedicalCounter.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
-import { getEmploymentDate, getPlaceOfAssignment } from "../../utils/rms/test.js";
+import { getEmploymentDate, getPlaceOfAssignment, getEmployeeIdentity } from "../../utils/rms/test.js";
 import mongoose from 'mongoose';
 
 const router = Router();
@@ -57,6 +57,30 @@ router.post("/register_request_medical", auth, roleCheck(["user", "admin"]), asy
 
     // Set place_of_assignment from HRIS
     req.body.place_of_assignment = hrPlaceOfAssignment.PositionName;
+
+    // Pull canonical name parts from HRIS so the slip prints the real
+    // employee name regardless of how the AD username was assembled.
+    // Best-effort: if HRIS is unreachable, fall back to splitting
+    // domain_user (the legacy behavior) so we don't block submission.
+    try {
+      const hrIdentity = await getEmployeeIdentity(user.user);
+      if (hrIdentity) {
+        req.body.employee_first_name = hrIdentity.Name || '';
+        req.body.employee_middle_name = hrIdentity.FName || '';
+        req.body.employee_last_name = hrIdentity.GFName || '';
+      } else {
+        const parts = String(user.user || '').split('.');
+        req.body.employee_first_name = parts[0] || '';
+        req.body.employee_middle_name = parts[1] || '';
+        req.body.employee_last_name = parts.slice(2).join(' ') || '';
+      }
+    } catch (idErr) {
+      console.error('HRIS identity lookup failed (register medical):', idErr.message);
+      const parts = String(user.user || '').split('.');
+      req.body.employee_first_name = parts[0] || '';
+      req.body.employee_middle_name = parts[1] || '';
+      req.body.employee_last_name = parts.slice(2).join(' ') || '';
+    }
 
     // Validate is_Spouse logic
     if (req.body.is_Spouse) {
@@ -135,14 +159,49 @@ router.patch("/view_request_medical", auth, roleCheck(["admin"]), async (req, re
     delete req.body.place_of_assignment;
     delete req.body.name_of_supervisor;
 
-    // Now validate (should pass with empty object or minimal fields)
-    // const { error } = medical_BodyValidation(req.body);
-    // if (error)
-    //   return res.status(400).json({ error: true, message: error.details[0].message });
+    // Accept an optional approval_date from the admin so they can back-date
+    // a medical slip when the actual visit happened earlier. Future dates
+    // are rejected; missing/invalid values fall back to now.
+    let approvalDate = new Date();
+    if (req.body.approval_date) {
+      const parsed = new Date(req.body.approval_date);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: true, message: "Invalid approval date" });
+      }
+      // Compare end-of-day in case the picker sends a midnight ISO; today must be allowed.
+      const endOfToday = new Date();
+      endOfToday.setHours(23, 59, 59, 999);
+      if (parsed.getTime() > endOfToday.getTime()) {
+        return res.status(400).json({ error: true, message: "Approval date cannot be in the future" });
+      }
+      approvalDate = parsed;
+    }
+    delete req.body.approval_date;
+
+    // Re-fetch HRIS names at approval time so we capture the latest values
+    // (employee may have had their record updated since submission). Falls
+    // back to whatever the request was originally saved with.
+    let approvalNames = {
+      employee_first_name: originalRequest.employee_first_name,
+      employee_middle_name: originalRequest.employee_middle_name,
+      employee_last_name: originalRequest.employee_last_name,
+    };
+    try {
+      const hrIdentity = await getEmployeeIdentity(originalRequest.domain_user);
+      if (hrIdentity) {
+        approvalNames = {
+          employee_first_name: hrIdentity.Name || approvalNames.employee_first_name || '',
+          employee_middle_name: hrIdentity.FName || approvalNames.employee_middle_name || '',
+          employee_last_name: hrIdentity.GFName || approvalNames.employee_last_name || '',
+        };
+      }
+    } catch (idErr) {
+      console.error('HRIS identity lookup failed (approve medical):', idErr.message);
+    }
 
     // Set approval fields
     req.body.viewed_by = user.user;
-    req.body.viewed_date = Date.now();
+    req.body.viewed_date = approvalDate;
     req.body.status = "Viewed";
     req.body.employee_count = 1;
 
@@ -156,6 +215,9 @@ router.patch("/view_request_medical", auth, roleCheck(["admin"]), async (req, re
         medical.status = req.body.status;
         medical.employee_count = req.body.employee_count;
         medical.reference_number = reference_number;
+        medical.employee_first_name = approvalNames.employee_first_name;
+        medical.employee_middle_name = approvalNames.employee_middle_name;
+        medical.employee_last_name = approvalNames.employee_last_name;
         return medical.save();
       })
       .then(async (updateResult) => {

@@ -335,7 +335,16 @@ router.get('/get_candidate', auth, roleCheck(["admin", "user"]), async(req,res,n
               
               // Special handling for Medical requests
               if (rest.request_type === 'Medical') {
-                  // Use spouse or child names based on is_Spouse flag
+                  // Preserve the canonical employee name (from HRIS, saved
+                  // on the Medical doc) under separate keys so the slip
+                  // render can still show the real employee even though
+                  // the admin table reuses employee_first_name to display
+                  // the dependent (spouse/child) name.
+                  result.actual_employee_first_name = rest.employee_first_name || '';
+                  result.actual_employee_middle_name = rest.employee_middle_name || '';
+                  result.actual_employee_last_name = rest.employee_last_name || '';
+
+                  // Use spouse or child names based on is_Spouse flag for table display
                   if (rest.is_Spouse) {
                       result.employee_first_name = rest.spouse_first_name || '';
                       result.employee_middle_name = rest.spouse_middle_name || '';
