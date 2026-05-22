@@ -181,10 +181,14 @@ router.get("/me/education", auth, async (req, res) => {
         if (!user) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
-        console.log(`[GET /me/education] caller username='${user.user}' _id=${user._id}`);
+        console.log(
+            `[GET /me/education] caller username='${user.user}' employeeId='${user.employee_id || '(none)'}' _id=${user._id}`
+        );
+        // Resolve UserId via EmployeeId (stable) — UserName fallback inside
+        // the helper. Pass both so the helper can pick.
         const [eduRows, certRows] = await Promise.all([
-            getEmployeeEducation(user.user).catch(() => []),
-            getEmployeeCertifications(user.user).catch(() => []),
+            getEmployeeEducation(user.user, user.employee_id).catch(() => []),
+            getEmployeeCertifications(user.user, user.employee_id).catch(() => []),
         ]);
         const education = (eduRows || []).map((r) => ({
             level: r.EducationLevel || "",

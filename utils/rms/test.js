@@ -375,38 +375,82 @@ const getEmployeeIdentity = async (username) => {
     }
 };
 
+// Resolve HRIS UserId for a caller, preferring EmployeeId (stable,
+// business-unique) over UserName (which can have duplicates from
+// renames / re-onboarding in long-lived HR DBs).
+//
+// Returns the resolved UserId (int) or null. Logs which path won so the
+// iisnode log shows whether we found via EmployeeId or fell back to the
+// UserName join.
+//
+// IMPORTANT: assumes a live mssql connection is already open — caller
+// owns sql.connect/sql.close so we don't churn the pool.
+const _resolveHrisUserId = async (username, employeeId) => {
+    // Primary: lookup via EmployeeDetail.EmployeeId.
+    if (employeeId) {
+        const r = new sql.Request();
+        r.input('eid', sql.NVarChar, employeeId);
+        const result = await r.query(
+            'SELECT TOP 1 UserId FROM dbo.EmployeeDetail WHERE EmployeeId = @eid'
+        );
+        if (result.recordset && result.recordset.length > 0) {
+            const uid = result.recordset[0].UserId;
+            console.log(
+                `[resolveHrisUserId] via EmployeeId='${employeeId}' -> UserId=${uid}`
+            );
+            return uid;
+        }
+        console.warn(
+            `[resolveHrisUserId] EmployeeId='${employeeId}' NOT in EmployeeDetail; falling back to UserName`
+        );
+    }
+
+    // Fallback: lookup via UserProfile.UserName JOIN-ed with EmployeeDetail.
+    // Joining EmployeeDetail filters out orphan UserProfile rows (legacy
+    // duplicates), so we get the same UserId getEmployeeIdentity finds.
+    const r = new sql.Request();
+    r.input('un', sql.NVarChar, username);
+    const result = await r.query(`
+        SELECT TOP 1 ed.UserId
+        FROM dbo.EmployeeDetail ed
+        JOIN dbo.UserProfile u ON u.UserId = ed.UserId
+        WHERE u.UserName = @un
+    `);
+    if (result.recordset && result.recordset.length > 0) {
+        const uid = result.recordset[0].UserId;
+        console.log(
+            `[resolveHrisUserId] via UserName='${username}' -> UserId=${uid}`
+        );
+        return uid;
+    }
+    console.warn(
+        `[resolveHrisUserId] No HRIS UserId for username='${username}' employeeId='${employeeId || '(none)'}'`
+    );
+    return null;
+};
+
 // HRIS lookup: every EmployeeEducation row for the caller, with the FK
 // lookup tables resolved. Empty array if HRIS is unreachable or no row.
 // Sorted by GraduationYear DESC so the most recent / highest degree
-// renders first (MSc above BSc), matching how people list education on
-// a CV.
+// renders first (MSc above BSc).
 //
-// Two-step: resolve UserProfile.UserName → UserId first, then run the
-// data query against UserId. Splitting the lookup makes the join target
-// visible in logs — if the resolved UserId doesn't match the rows in
-// EmployeeEducation, we can spot it instead of guessing.
-const getEmployeeEducation = async (username) => {
+// Resolves UserId via EmployeeId first (stable, business-unique key),
+// falling back to UserName JOINed with EmployeeDetail. Avoids the
+// orphan-UserProfile trap where two rows share a UserName and one has
+// no EmployeeDetail — the legacy join-less SELECT would pick the wrong
+// one, leaving education records invisible.
+const getEmployeeEducation = async (username, employeeId) => {
     try {
         await sql.connect(dbConfig);
 
-        // Step 1: resolve UserProfile.UserId from UserName.
-        const idReq = new sql.Request();
-        idReq.input('username', sql.NVarChar, username);
-        const idResult = await idReq.query(
-            'SELECT UserId FROM dbo.UserProfile WHERE UserName = @username'
-        );
-        if (!idResult.recordset || idResult.recordset.length === 0) {
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
             console.warn(
-                `[getEmployeeEducation] No UserProfile row for username='${username}'`
+                `[getEmployeeEducation] no UserId resolved for username='${username}' employeeId='${employeeId || '(none)'}'`
             );
             return [];
         }
-        const userId = idResult.recordset[0].UserId;
-        console.log(
-            `[getEmployeeEducation] username='${username}' resolved UserId=${userId}`
-        );
 
-        // Step 2: fetch education rows for that UserId.
         const eduReq = new sql.Request();
         eduReq.input('userId', sql.Int, userId);
         const query = `
@@ -428,7 +472,8 @@ const getEmployeeEducation = async (username) => {
         `;
         console.log(
             '[getEmployeeEducation] SQL:',
-            query.replace(/\s+/g, ' ').trim()
+            query.replace(/\s+/g, ' ').trim(),
+            `(@userId=${userId})`
         );
         const result = await eduReq.query(query);
         const rows = result.recordset || [];
@@ -455,34 +500,20 @@ const getEmployeeEducation = async (username) => {
 };
 
 // HRIS lookup: every EmployeeCertification row for the caller, with the
-// FK lookup tables resolved. Empty array on failure or no rows. Sorted
-// by [To] DESC so the most-recent / still-valid certification appears
-// first. Sibling of getEmployeeEducation — both feed the profile
-// screen's Education tab.
-//
-// Two-step same as getEmployeeEducation — see comment there.
-const getEmployeeCertifications = async (username) => {
+// FK lookup tables resolved. Same UserId-resolution strategy as
+// getEmployeeEducation — EmployeeId first, UserName JOINed fallback.
+const getEmployeeCertifications = async (username, employeeId) => {
     try {
         await sql.connect(dbConfig);
 
-        // Step 1: resolve UserProfile.UserId from UserName.
-        const idReq = new sql.Request();
-        idReq.input('username', sql.NVarChar, username);
-        const idResult = await idReq.query(
-            'SELECT UserId FROM dbo.UserProfile WHERE UserName = @username'
-        );
-        if (!idResult.recordset || idResult.recordset.length === 0) {
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
             console.warn(
-                `[getEmployeeCertifications] No UserProfile row for username='${username}'`
+                `[getEmployeeCertifications] no UserId resolved for username='${username}' employeeId='${employeeId || '(none)'}'`
             );
             return [];
         }
-        const userId = idResult.recordset[0].UserId;
-        console.log(
-            `[getEmployeeCertifications] username='${username}' resolved UserId=${userId}`
-        );
 
-        // Step 2: fetch certification rows for that UserId.
         const certReq = new sql.Request();
         certReq.input('userId', sql.Int, userId);
         const query = `
@@ -500,7 +531,8 @@ const getEmployeeCertifications = async (username) => {
         `;
         console.log(
             '[getEmployeeCertifications] SQL:',
-            query.replace(/\s+/g, ' ').trim()
+            query.replace(/\s+/g, ' ').trim(),
+            `(@userId=${userId})`
         );
         const result = await certReq.query(query);
         const rows = result.recordset || [];
