@@ -9,7 +9,7 @@ import mongoose from 'mongoose';
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { authentication } from "../../utils/rms/ldapConnect.js";
-import { getEmployeeIdentity, getEmployeeEducation, test as hrisExperiences } from "../../utils/rms/test.js";
+import { getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, test as hrisExperiences } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -161,12 +161,17 @@ router.get("/me/experiences", auth, async (req, res) => {
     }
 });
 
-// GET /me/education — HRIS EmployeeEducation rows for the caller.
+// GET /me/education — HRIS academic + certification rows for the caller.
 //
-// Powers the profile screen's Education tab. Backend handles the lookup
-// joins (luEducationLevel / luStudyField / luInstitution) and projects
-// to a clean snake_case shape so mobile doesn't need to know the SQL
-// surface. Empty array when HRIS is unreachable or no rows.
+// Powers the profile screen's Education tab. Returns two parallel arrays:
+//   - education     → EmployeeEducation joined with luEducationLevel /
+//                     luStudyField / luInstitution (sorted GraduationYear DESC)
+//   - certifications → EmployeeCertification joined with luStudyField /
+//                     luInstitution (sorted ToDate DESC)
+//
+// Both arrays are independent — an employee with no degrees but a stack
+// of certifications still gets their certs rendered. Empty arrays when
+// HRIS is unreachable or no rows.
 //
 // IMPORTANT: must be declared BEFORE the catch-all `/:id` route below;
 // otherwise Express treats "me" as a user id and 500s on CastError.
@@ -176,8 +181,11 @@ router.get("/me/education", auth, async (req, res) => {
         if (!user) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
-        const rows = await getEmployeeEducation(user.user).catch(() => []);
-        const education = (rows || []).map((r) => ({
+        const [eduRows, certRows] = await Promise.all([
+            getEmployeeEducation(user.user).catch(() => []),
+            getEmployeeCertifications(user.user).catch(() => []),
+        ]);
+        const education = (eduRows || []).map((r) => ({
             level: r.EducationLevel || "",
             field: r.FieldOfStudy || "",
             institution: r.Institution || "",
@@ -187,7 +195,14 @@ router.get("/me/education", auth, async (req, res) => {
             commitment_level: r.CommitmentLevel || "",
             remark: r.Remark || "",
         }));
-        return res.json({ error: false, education });
+        const certifications = (certRows || []).map((r) => ({
+            status: r.Status || "",
+            field: r.Field || "",
+            institution: r.Institution || "",
+            to_date: r.ToDate ? new Date(r.ToDate).toISOString() : null,
+            date_interval: r.DateInterval || "",
+        }));
+        return res.json({ error: false, education, certifications });
     } catch (e) {
         console.error("GET /me/education error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });

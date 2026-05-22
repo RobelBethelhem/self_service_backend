@@ -414,4 +414,39 @@ const getEmployeeEducation = async (username) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation };
+// HRIS lookup: every EmployeeCertification row for the caller, with the
+// FK lookup tables resolved. Empty array on failure or no rows. Sorted
+// by [To] DESC so the most-recent / still-valid certification appears
+// first. Sibling of getEmployeeEducation — both feed the profile
+// screen's Education tab.
+const getEmployeeCertifications = async (username) => {
+    try {
+        await sql.connect(dbConfig);
+        const request = new sql.Request();
+
+        const query = `
+            SELECT
+                ec.Status        AS Status,
+                fld.Field        AS Field,
+                inst.Institution AS Institution,
+                ec.[To]          AS ToDate,
+                ec.DateInterval  AS DateInterval
+            FROM dbo.EmployeeCertification ec
+            JOIN dbo.UserProfile u ON u.UserId = ec.UserId
+            LEFT JOIN dbo.luStudyField  fld  ON fld.Id  = ec.FieldOfStudy
+            LEFT JOIN dbo.luInstitution inst ON inst.Id = ec.Institution
+            WHERE u.UserName = @username
+            ORDER BY ec.[To] DESC
+        `;
+        request.input('username', sql.NVarChar, username);
+        const result = await request.query(query);
+        return result.recordset || [];
+    } catch (e) {
+        console.error("Error fetching employee certifications:", e.message);
+        return [];
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications };
