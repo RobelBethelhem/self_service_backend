@@ -9,6 +9,7 @@ import mongoose from 'mongoose';
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { authentication } from "../../utils/rms/ldapConnect.js";
+import { getEmployeeIdentity } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -23,9 +24,9 @@ router.post("/verify-token", async(req,res)=>{
         const isUsedToken = await UsedToken.find({token:token});
         if(isUsedToken.length > 0)
             res.status(401).json({error:true, message:"Used Token"})
-        
+
         jwt.verify(token,accessToken);
-      
+
         res.status(200).json({error: false, message: "Correct"})
     }
     catch (err){
@@ -33,6 +34,44 @@ router.post("/verify-token", async(req,res)=>{
         res.status(500).json({error:true, message: "Internal Server Error"});
     }
 })
+
+// GET /me — canonical profile of the authenticated user.
+//
+// Returns the Mongo User row enriched with HRIS canonical name parts
+// (Name / FName / GFName) so mobile + web greeting cards can render the
+// real employee's name rather than a domain-username split. HRIS is
+// best-effort — if SQL Server is unreachable we fall back to the Mongo
+// row alone so /me never 500s on transient HRIS outages.
+//
+// IMPORTANT: this route must come BEFORE the catch-all `/:id` further
+// down the file, otherwise Express will treat "me" as a user id.
+router.get("/me", auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(404).json({ error: true, message: "User not found" });
+        }
+        const hr = await getEmployeeIdentity(user.user).catch(() => null);
+        const profile = {
+            first_name: (hr && hr.Name) || user.first_name || "",
+            middle_name: (hr && hr.FName) || "",
+            last_name: (hr && hr.GFName) || user.last_name || "",
+            user: user.user,
+            email: user.email,
+            position: user.position || "",
+            department: user.department || "",
+            employee_id: (hr && hr.EmployeeId)
+                ? String(hr.EmployeeId)
+                : (user.employee_id || ""),
+            roles: user.roles || [],
+            source: hr ? "hris" : "user_collection",
+        };
+        return res.json({ error: false, user: profile });
+    } catch (e) {
+        console.error("GET /me error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
 
 //signup
 router.post("/signUp", auth, roleCheck(["admin"]), async(req,res)=>{
