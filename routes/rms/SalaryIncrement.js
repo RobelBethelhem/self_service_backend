@@ -648,11 +648,17 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
         // prefer the HRIS canonical name (Name / FName / GFName) and HRIS
         // EmployeeId. Mongo User row is a non-blocking fallback if HRIS is
         // unreachable.
+        //
+        // Position is also exposed here (preferring HRIS CurrentPosition,
+        // i.e. the latest internal experience row) so the mobile greeting
+        // card can use this endpoint as a fallback when /me isn't yet
+        // deployed, and still show a current job title.
         let employeeInfo = {
             first_name: user.first_name || "",
             middle_name: "",
             last_name: user.last_name || "",
             employee_id: user.employee_id || "",
+            position: user.position || "",
             domain_user: user.user,
             source: "user_collection",
         };
@@ -664,6 +670,7 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 employee_id: hrIdentity.EmployeeId
                     ? String(hrIdentity.EmployeeId)
                     : employeeInfo.employee_id,
+                position: hrIdentity.CurrentPosition || employeeInfo.position,
                 domain_user: user.user,
                 source: "hris",
             };

@@ -303,11 +303,19 @@ ORDER BY
     }
 };
 
-// Lighter-weight HRIS lookup that returns just the employee's canonical
-// name parts and EmployeeId, without joining EmployeeExperience. Used by
-// the salary-increment agreement modal where we only need the identity —
-// employees who don't (yet) have an EmployeeExperience row would be
-// invisible to test() but visible here.
+// Lighter-weight HRIS lookup: canonical name parts, EmployeeId, and the
+// CURRENT internal position. Used by the salary-increment agreement
+// modal, the /me endpoint, and any caller that needs identity + current
+// job title in a single round-trip.
+//
+// CurrentPosition is the position from the latest internal experience
+// row, ordering by:
+//   1. Active rows first (To IS NULL) — represents the currently-held role
+//   2. Then by From DESC — most recently started among the rest
+// Falls back to null if the employee has no EmployeeExperience row, so the
+// caller can fall back to the Mongo user.position. We deliberately do NOT
+// inner-join EmployeeExperience on the outer query — employees with no
+// experience row should still resolve identity (name + EmployeeId).
 const getEmployeeIdentity = async (username) => {
     try {
         await sql.connect(dbConfig);
@@ -318,7 +326,17 @@ const getEmployeeIdentity = async (username) => {
                 a.[Name]       AS Name,
                 a.[FName]      AS FName,
                 a.[GFName]     AS GFName,
-                a.[EmployeeId] AS EmployeeId
+                a.[EmployeeId] AS EmployeeId,
+                (
+                    SELECT TOP 1 p.[Postion]
+                    FROM EmployeeExperience e
+                    JOIN luPosition p ON p.Id = e.Position
+                    WHERE e.UserId = a.UserId
+                      AND e.ExperienceType = 1
+                    ORDER BY
+                        CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END,
+                        e.[From] DESC
+                ) AS CurrentPosition
             FROM EmployeeDetail a
             JOIN UserProfile  d ON d.UserId = a.UserId
             WHERE d.UserName = @username

@@ -58,7 +58,11 @@ router.get("/me", auth, async (req, res) => {
             last_name: (hr && hr.GFName) || user.last_name || "",
             user: user.user,
             email: user.email,
-            position: user.position || "",
+            // Prefer the latest internal HRIS position (which moves with
+            // promotions / transfers). Fall back to the Mongo user.position
+            // only if HRIS has no experience row yet — that field is static,
+            // set at signup, and goes stale.
+            position: (hr && hr.CurrentPosition) || user.position || "",
             department: user.department || "",
             employee_id: (hr && hr.EmployeeId)
                 ? String(hr.EmployeeId)
