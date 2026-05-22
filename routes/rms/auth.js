@@ -9,9 +9,26 @@ import mongoose from 'mongoose';
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { authentication } from "../../utils/rms/ldapConnect.js";
-import { getEmployeeIdentity, test as hrisExperiences } from "../../utils/rms/test.js";
+import { getEmployeeIdentity, getEmployeeEducation, test as hrisExperiences } from "../../utils/rms/test.js";
 
 const router = Router();
+
+/**
+ * Server-side age computation from a DateOfBirth value. Centralized here
+ * so every API consumer sees the same number on the same calendar day,
+ * regardless of client clock skew or timezone. Returns null if the input
+ * isn't a parseable date.
+ */
+function computeAge(dob) {
+    if (!dob) return null;
+    const d = new Date(dob);
+    if (isNaN(d.getTime())) return null;
+    const today = new Date();
+    let age = today.getFullYear() - d.getFullYear();
+    const m = today.getMonth() - d.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < d.getDate())) age--;
+    return age;
+}
 
 //verify token
 router.post("/verify-token", async(req,res)=>{
@@ -75,6 +92,25 @@ router.get("/me", auth, async (req, res) => {
             net_salary: hr && hr.Salary != null ? Number(hr.Salary) : null,
             currency: "ETB",
             job_grade: (hr && hr.CurrentJobGrade) || "",
+            // Personal block — every field is best-effort. NOT NULL
+            // columns (Sex, MaritalStatus, DateOfBirth) only come back
+            // when HRIS is reachable; if the lookup failed they're "".
+            date_of_birth: hr && hr.DateOfBirth
+                ? new Date(hr.DateOfBirth).toISOString()
+                : null,
+            age: computeAge(hr && hr.DateOfBirth),
+            sex: (hr && hr.Sex) || "",
+            marital_status: (hr && hr.MaritalStatus) || "",
+            // Spouse row only renders when both flags are set — saves the
+            // mobile a conditional and matches what the user expects to
+            // see (married + has a recorded spouse name).
+            spouse_name: hr && hr.MaritalStatus &&
+                String(hr.MaritalStatus).toLowerCase() === "married"
+                ? (hr.SpouseName || "")
+                : "",
+            tin_number: (hr && hr.TINNumber) || "",
+            pension_number: (hr && hr.PensionNumber) || "",
+            employment_type: (hr && hr.EmploymentType) || "",
             source: hr ? "hris" : "user_collection",
         };
         return res.json({ error: false, user: profile });
@@ -121,6 +157,39 @@ router.get("/me/experiences", auth, async (req, res) => {
         return res.json({ error: false, experiences });
     } catch (e) {
         console.error("GET /me/experiences error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// GET /me/education — HRIS EmployeeEducation rows for the caller.
+//
+// Powers the profile screen's Education tab. Backend handles the lookup
+// joins (luEducationLevel / luStudyField / luInstitution) and projects
+// to a clean snake_case shape so mobile doesn't need to know the SQL
+// surface. Empty array when HRIS is unreachable or no rows.
+//
+// IMPORTANT: must be declared BEFORE the catch-all `/:id` route below;
+// otherwise Express treats "me" as a user id and 500s on CastError.
+router.get("/me/education", auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(404).json({ error: true, message: "User not found" });
+        }
+        const rows = await getEmployeeEducation(user.user).catch(() => []);
+        const education = (rows || []).map((r) => ({
+            level: r.EducationLevel || "",
+            field: r.FieldOfStudy || "",
+            institution: r.Institution || "",
+            cgpa: r.CGPA != null ? Number(r.CGPA) : null,
+            graduation_year: r.GraduationYear != null ? Number(r.GraduationYear) : null,
+            sponsorship: r.Sponsorship || "",
+            commitment_level: r.CommitmentLevel || "",
+            remark: r.Remark || "",
+        }));
+        return res.json({ error: false, education });
+    } catch (e) {
+        console.error("GET /me/education error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
     }
 });

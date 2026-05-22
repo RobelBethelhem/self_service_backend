@@ -335,6 +335,13 @@ const getEmployeeIdentity = async (username) => {
                 a.[EmployeeId]     AS EmployeeId,
                 a.[Salary]         AS Salary,
                 a.[EmploymentDate] AS EmploymentDate,
+                a.[DateOfBirth]    AS DateOfBirth,
+                a.[Sex]            AS Sex,
+                a.[MaritalStatus]  AS MaritalStatus,
+                a.[SpouseName]     AS SpouseName,
+                a.[TINNumber]      AS TINNumber,
+                a.[PensionNumber]  AS PensionNumber,
+                a.[EmploymentType] AS EmploymentType,
                 le.[Postion]       AS CurrentPosition,
                 le.GradeName       AS CurrentJobGrade,
                 le.DeptName        AS CurrentDepartment
@@ -368,4 +375,43 @@ const getEmployeeIdentity = async (username) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity };
+// HRIS lookup: every EmployeeEducation row for the caller, with the FK
+// lookup tables resolved. Empty array if HRIS is unreachable or the row
+// just isn't there yet. Sorted by GraduationYear DESC so the latest
+// (highest) degree renders first — that's the order people expect on a
+// profile (MSc above BSc, not the other way around).
+const getEmployeeEducation = async (username) => {
+    try {
+        await sql.connect(dbConfig);
+        const request = new sql.Request();
+
+        const query = `
+            SELECT
+                lvl.Level             AS EducationLevel,
+                fld.Field             AS FieldOfStudy,
+                inst.Institution      AS Institution,
+                ee.CGPA               AS CGPA,
+                ee.GraduationYear     AS GraduationYear,
+                ee.Sponsorship        AS Sponsorship,
+                ee.CommitmentLevel    AS CommitmentLevel,
+                ee.Remark             AS Remark
+            FROM dbo.EmployeeEducation ee
+            JOIN dbo.UserProfile u ON u.UserId = ee.UserId
+            LEFT JOIN dbo.luEducationLevel lvl  ON lvl.Id  = ee.Level
+            LEFT JOIN dbo.luStudyField     fld  ON fld.Id  = ee.FieldOfStudy
+            LEFT JOIN dbo.luInstitution    inst ON inst.Id = ee.Institution
+            WHERE u.UserName = @username
+            ORDER BY ee.GraduationYear DESC
+        `;
+        request.input('username', sql.NVarChar, username);
+        const result = await request.query(query);
+        return result.recordset || [];
+    } catch (e) {
+        console.error("Error fetching employee education:", e.message);
+        return [];
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation };
