@@ -35,8 +35,18 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
       reference_number: 1,
     };
 
-    // Guaranty additionally has revoked_date
-    const guarantyProjection = { ...baseProjection, revoked_date: 1 };
+    // Guaranty additionally has revoked_date plus the guarantor's name and
+    // organization, so a scanner can confirm WHO the bank is guaranteeing
+    // on whose behalf — not just the employee.
+    // NOTE: the model uses the typo `guaranty_organazation` (canonical).
+    const guarantyProjection = {
+      ...baseProjection,
+      revoked_date: 1,
+      guaranty_first_name: 1,
+      guaranty_middle_name: 1,
+      guaranty_last_name: 1,
+      guaranty_organazation: 1,
+    };
 
     const [exp, emb, gua, sup, sib] = await Promise.all([
       Experiance.findOne({ reference_number: ref }, baseProjection).lean(),
@@ -99,6 +109,25 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
       rejected_date: hit.status === "Rejected" ? hit.viewed_date || null : null,
       revoked_date: hit.revoked_date || null,
     };
+
+    // Guaranty-specific extras: who the bank is guaranteeing, and to which
+    // organization. Only set when the hit actually came from the Guaranty
+    // collection (gua), so other letter types stay unaffected.
+    if (gua) {
+      const guarantor_name = [
+        gua.guaranty_first_name,
+        gua.guaranty_middle_name,
+        gua.guaranty_last_name,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      if (guarantor_name) payload.guarantor_name = guarantor_name;
+      if (gua.guaranty_organazation) {
+        // Expose under the corrected spelling on the API so frontends
+        // don't have to perpetuate the schema typo.
+        payload.guarantor_organization = gua.guaranty_organazation;
+      }
+    }
 
     return res.json(payload);
   } catch (e) {
