@@ -376,15 +376,39 @@ const getEmployeeIdentity = async (username) => {
 };
 
 // HRIS lookup: every EmployeeEducation row for the caller, with the FK
-// lookup tables resolved. Empty array if HRIS is unreachable or the row
-// just isn't there yet. Sorted by GraduationYear DESC so the latest
-// (highest) degree renders first — that's the order people expect on a
-// profile (MSc above BSc, not the other way around).
+// lookup tables resolved. Empty array if HRIS is unreachable or no row.
+// Sorted by GraduationYear DESC so the most recent / highest degree
+// renders first (MSc above BSc), matching how people list education on
+// a CV.
+//
+// Two-step: resolve UserProfile.UserName → UserId first, then run the
+// data query against UserId. Splitting the lookup makes the join target
+// visible in logs — if the resolved UserId doesn't match the rows in
+// EmployeeEducation, we can spot it instead of guessing.
 const getEmployeeEducation = async (username) => {
     try {
         await sql.connect(dbConfig);
-        const request = new sql.Request();
 
+        // Step 1: resolve UserProfile.UserId from UserName.
+        const idReq = new sql.Request();
+        idReq.input('username', sql.NVarChar, username);
+        const idResult = await idReq.query(
+            'SELECT UserId FROM dbo.UserProfile WHERE UserName = @username'
+        );
+        if (!idResult.recordset || idResult.recordset.length === 0) {
+            console.warn(
+                `[getEmployeeEducation] No UserProfile row for username='${username}'`
+            );
+            return [];
+        }
+        const userId = idResult.recordset[0].UserId;
+        console.log(
+            `[getEmployeeEducation] username='${username}' resolved UserId=${userId}`
+        );
+
+        // Step 2: fetch education rows for that UserId.
+        const eduReq = new sql.Request();
+        eduReq.input('userId', sql.Int, userId);
         const query = `
             SELECT
                 lvl.Level             AS EducationLevel,
@@ -396,18 +420,34 @@ const getEmployeeEducation = async (username) => {
                 ee.CommitmentLevel    AS CommitmentLevel,
                 ee.Remark             AS Remark
             FROM dbo.EmployeeEducation ee
-            JOIN dbo.UserProfile u ON u.UserId = ee.UserId
             LEFT JOIN dbo.luEducationLevel lvl  ON lvl.Id  = ee.Level
             LEFT JOIN dbo.luStudyField     fld  ON fld.Id  = ee.FieldOfStudy
             LEFT JOIN dbo.luInstitution    inst ON inst.Id = ee.Institution
-            WHERE u.UserName = @username
+            WHERE ee.UserId = @userId
             ORDER BY ee.GraduationYear DESC
         `;
-        request.input('username', sql.NVarChar, username);
-        const result = await request.query(query);
-        return result.recordset || [];
+        console.log(
+            '[getEmployeeEducation] SQL:',
+            query.replace(/\s+/g, ' ').trim()
+        );
+        const result = await eduReq.query(query);
+        const rows = result.recordset || [];
+        console.log(
+            `[getEmployeeEducation] UserId=${userId} rows=${rows.length}`
+        );
+        if (rows.length > 0) {
+            console.log(
+                '[getEmployeeEducation] sample:',
+                JSON.stringify(rows[0])
+            );
+        }
+        return rows;
     } catch (e) {
-        console.error("Error fetching employee education:", e.message);
+        console.error(
+            '[getEmployeeEducation] Error:',
+            e.message,
+            e.stack
+        );
         return [];
     } finally {
         await sql.close();
@@ -419,11 +459,32 @@ const getEmployeeEducation = async (username) => {
 // by [To] DESC so the most-recent / still-valid certification appears
 // first. Sibling of getEmployeeEducation — both feed the profile
 // screen's Education tab.
+//
+// Two-step same as getEmployeeEducation — see comment there.
 const getEmployeeCertifications = async (username) => {
     try {
         await sql.connect(dbConfig);
-        const request = new sql.Request();
 
+        // Step 1: resolve UserProfile.UserId from UserName.
+        const idReq = new sql.Request();
+        idReq.input('username', sql.NVarChar, username);
+        const idResult = await idReq.query(
+            'SELECT UserId FROM dbo.UserProfile WHERE UserName = @username'
+        );
+        if (!idResult.recordset || idResult.recordset.length === 0) {
+            console.warn(
+                `[getEmployeeCertifications] No UserProfile row for username='${username}'`
+            );
+            return [];
+        }
+        const userId = idResult.recordset[0].UserId;
+        console.log(
+            `[getEmployeeCertifications] username='${username}' resolved UserId=${userId}`
+        );
+
+        // Step 2: fetch certification rows for that UserId.
+        const certReq = new sql.Request();
+        certReq.input('userId', sql.Int, userId);
         const query = `
             SELECT
                 ec.Status        AS Status,
@@ -432,17 +493,33 @@ const getEmployeeCertifications = async (username) => {
                 ec.[To]          AS ToDate,
                 ec.DateInterval  AS DateInterval
             FROM dbo.EmployeeCertification ec
-            JOIN dbo.UserProfile u ON u.UserId = ec.UserId
             LEFT JOIN dbo.luStudyField  fld  ON fld.Id  = ec.FieldOfStudy
             LEFT JOIN dbo.luInstitution inst ON inst.Id = ec.Institution
-            WHERE u.UserName = @username
+            WHERE ec.UserId = @userId
             ORDER BY ec.[To] DESC
         `;
-        request.input('username', sql.NVarChar, username);
-        const result = await request.query(query);
-        return result.recordset || [];
+        console.log(
+            '[getEmployeeCertifications] SQL:',
+            query.replace(/\s+/g, ' ').trim()
+        );
+        const result = await certReq.query(query);
+        const rows = result.recordset || [];
+        console.log(
+            `[getEmployeeCertifications] UserId=${userId} rows=${rows.length}`
+        );
+        if (rows.length > 0) {
+            console.log(
+                '[getEmployeeCertifications] sample:',
+                JSON.stringify(rows[0])
+            );
+        }
+        return rows;
     } catch (e) {
-        console.error("Error fetching employee certifications:", e.message);
+        console.error(
+            '[getEmployeeCertifications] Error:',
+            e.message,
+            e.stack
+        );
         return [];
     } finally {
         await sql.close();

@@ -181,6 +181,7 @@ router.get("/me/education", auth, async (req, res) => {
         if (!user) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
+        console.log(`[GET /me/education] caller username='${user.user}' _id=${user._id}`);
         const [eduRows, certRows] = await Promise.all([
             getEmployeeEducation(user.user).catch(() => []),
             getEmployeeCertifications(user.user).catch(() => []),
@@ -202,6 +203,9 @@ router.get("/me/education", auth, async (req, res) => {
             to_date: r.ToDate ? new Date(r.ToDate).toISOString() : null,
             date_interval: r.DateInterval || "",
         }));
+        console.log(
+            `[GET /me/education] response: education=${education.length} certifications=${certifications.length}`
+        );
         return res.json({ error: false, education, certifications });
     } catch (e) {
         console.error("GET /me/education error:", e);
