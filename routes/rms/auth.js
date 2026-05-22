@@ -9,7 +9,7 @@ import mongoose from 'mongoose';
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { authentication } from "../../utils/rms/ldapConnect.js";
-import { getEmployeeIdentity } from "../../utils/rms/test.js";
+import { getEmployeeIdentity, test as hrisExperiences } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -63,16 +63,64 @@ router.get("/me", auth, async (req, res) => {
             // only if HRIS has no experience row yet — that field is static,
             // set at signup, and goes stale.
             position: (hr && hr.CurrentPosition) || user.position || "",
-            department: user.department || "",
+            department: (hr && hr.CurrentDepartment) || user.department || "",
             employee_id: (hr && hr.EmployeeId)
                 ? String(hr.EmployeeId)
                 : (user.employee_id || ""),
             roles: user.roles || [],
+            // HRIS-sourced fields used by the profile screen.
+            joined_date: hr && hr.EmploymentDate
+                ? new Date(hr.EmploymentDate).toISOString()
+                : null,
+            net_salary: hr && hr.Salary != null ? Number(hr.Salary) : null,
+            currency: "ETB",
+            job_grade: (hr && hr.CurrentJobGrade) || "",
             source: hr ? "hris" : "user_collection",
         };
         return res.json({ error: false, user: profile });
     } catch (e) {
         console.error("GET /me error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// GET /me/experiences — HRIS internal experience history for the caller.
+//
+// Powers the profile screen's Experience tab. Returns the same data the
+// Experience letter consumes (test()), normalized to a clean shape and
+// sorted active-first then by From DESC. Empty array when HRIS is
+// unreachable or the employee has no experience rows.
+//
+// IMPORTANT: must be declared BEFORE the catch-all `/:id` route below;
+// otherwise Express would treat "me" as a user id and 500 on CastError.
+router.get("/me/experiences", auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(404).json({ error: true, message: "User not found" });
+        }
+        const rows = await hrisExperiences(user.user).catch(() => null);
+        if (!rows || !Array.isArray(rows)) {
+            return res.json({ error: false, experiences: [] });
+        }
+        const experiences = rows.map((r) => ({
+            position: r.Postion || "",
+            job_grade: r.Job_Grade || "",
+            from: r.From ? new Date(r.From).toISOString() : null,
+            to: r.To ? new Date(r.To).toISOString() : null,
+        }));
+        // Active (no To) rows first, then most recent start date.
+        experiences.sort((a, b) => {
+            if ((a.to == null) !== (b.to == null)) {
+                return a.to == null ? -1 : 1;
+            }
+            const ad = a.from ? new Date(a.from).getTime() : 0;
+            const bd = b.from ? new Date(b.from).getTime() : 0;
+            return bd - ad;
+        });
+        return res.json({ error: false, experiences });
+    } catch (e) {
+        console.error("GET /me/experiences error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
     }
 });

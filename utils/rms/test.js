@@ -321,24 +321,40 @@ const getEmployeeIdentity = async (username) => {
         await sql.connect(dbConfig);
         const request = new sql.Request();
 
+        // OUTER APPLY pulls the latest internal experience's position +
+        // grade + department in a single round-trip, so callers get
+        // identity AND current job context without making a second query.
+        // OUTER (not CROSS) APPLY: employees without an experience row
+        // still resolve to identity columns with the apply columns NULL —
+        // the caller picks the fallback.
         const query = `
             SELECT TOP 1
-                a.[Name]       AS Name,
-                a.[FName]      AS FName,
-                a.[GFName]     AS GFName,
-                a.[EmployeeId] AS EmployeeId,
-                (
-                    SELECT TOP 1 p.[Postion]
-                    FROM EmployeeExperience e
-                    JOIN luPosition p ON p.Id = e.Position
-                    WHERE e.UserId = a.UserId
-                      AND e.ExperienceType = 1
-                    ORDER BY
-                        CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END,
-                        e.[From] DESC
-                ) AS CurrentPosition
+                a.[Name]           AS Name,
+                a.[FName]          AS FName,
+                a.[GFName]         AS GFName,
+                a.[EmployeeId]     AS EmployeeId,
+                a.[Salary]         AS Salary,
+                a.[EmploymentDate] AS EmploymentDate,
+                le.[Postion]       AS CurrentPosition,
+                le.GradeName       AS CurrentJobGrade,
+                le.DeptName        AS CurrentDepartment
             FROM EmployeeDetail a
-            JOIN UserProfile  d ON d.UserId = a.UserId
+            JOIN UserProfile d ON d.UserId = a.UserId
+            OUTER APPLY (
+                SELECT TOP 1
+                    p.[Postion],
+                    g.[Name] AS GradeName,
+                    dept.[Name] AS DeptName
+                FROM EmployeeExperience e
+                JOIN luPosition p ON p.Id = e.Position
+                LEFT JOIN luJobGrade g ON g.Id = p.Grade
+                LEFT JOIN luDepartment dept ON dept.Id = p.Department
+                WHERE e.UserId = a.UserId
+                  AND e.ExperienceType = 1
+                ORDER BY
+                    CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END,
+                    e.[From] DESC
+            ) le
             WHERE d.UserName = @username
         `;
         request.input('username', sql.NVarChar, username);
