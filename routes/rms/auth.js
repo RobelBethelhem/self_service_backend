@@ -9,7 +9,7 @@ import mongoose from 'mongoose';
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { authentication } from "../../utils/rms/ldapConnect.js";
-import { getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, test as hrisExperiences } from "../../utils/rms/test.js";
+import { getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, _sanitizeHris, test as hrisExperiences } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -68,7 +68,14 @@ router.get("/me", auth, async (req, res) => {
         if (!user) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
-        const hr = await getEmployeeIdentity(user.user).catch(() => null);
+        // Two HRIS reads in parallel — identity + address. Address never
+        // blocks the response (best-effort, see catch handler on the
+        // helper) but it sits in /me so the Personal tab gets it without
+        // a second round-trip.
+        const [hr, addr] = await Promise.all([
+            getEmployeeIdentity(user.user).catch(() => null),
+            getEmployeeAddress(user.user, user.employee_id).catch(() => null),
+        ]);
         const profile = {
             first_name: (hr && hr.Name) || user.first_name || "",
             middle_name: (hr && hr.FName) || "",
@@ -111,6 +118,22 @@ router.get("/me", auth, async (req, res) => {
             tin_number: (hr && hr.TINNumber) || "",
             pension_number: (hr && hr.PensionNumber) || "",
             employment_type: (hr && hr.EmploymentType) || "",
+            // Address — every field passed through _sanitizeHris so a
+            // stored `***` placeholder collapses to "". Mobile renders
+            // only non-empty fields.
+            address: addr
+                ? {
+                      region: _sanitizeHris(addr.Region),
+                      city: _sanitizeHris(addr.City),
+                      zone: _sanitizeHris(addr.Zone),
+                      woreda: _sanitizeHris(addr.Woreda),
+                      kebele: _sanitizeHris(addr.Kebele),
+                      subcity: _sanitizeHris(addr.SubCity),
+                      house_number: _sanitizeHris(addr.HouseNumber),
+                      po_box: _sanitizeHris(addr.POBox),
+                      telephone: _sanitizeHris(addr.Telephone),
+                  }
+                : null,
             source: hr ? "hris" : "user_collection",
         };
         return res.json({ error: false, user: profile });
@@ -184,11 +207,14 @@ router.get("/me/education", auth, async (req, res) => {
         console.log(
             `[GET /me/education] caller username='${user.user}' employeeId='${user.employee_id || '(none)'}' _id=${user._id}`
         );
-        // Resolve UserId via EmployeeId (stable) — UserName fallback inside
-        // the helper. Pass both so the helper can pick.
-        const [eduRows, certRows] = await Promise.all([
+        // Three HRIS reads in parallel — education + certifications +
+        // trainings. All share the same UserId-resolution path inside
+        // the helpers, so a successful identity resolve cascades to all
+        // three. Each helper is independently best-effort.
+        const [eduRows, certRows, trainingRows] = await Promise.all([
             getEmployeeEducation(user.user, user.employee_id).catch(() => []),
             getEmployeeCertifications(user.user, user.employee_id).catch(() => []),
+            getEmployeeTrainings(user.user, user.employee_id).catch(() => []),
         ]);
         const education = (eduRows || []).map((r) => ({
             level: r.EducationLevel || "",
@@ -201,16 +227,27 @@ router.get("/me/education", auth, async (req, res) => {
             remark: r.Remark || "",
         }));
         const certifications = (certRows || []).map((r) => ({
-            status: r.Status || "",
-            field: r.Field || "",
-            institution: r.Institution || "",
+            status: _sanitizeHris(r.Status),
+            field: _sanitizeHris(r.Field),
+            institution: _sanitizeHris(r.Institution),
             to_date: r.ToDate ? new Date(r.ToDate).toISOString() : null,
-            date_interval: r.DateInterval || "",
+            date_interval: _sanitizeHris(r.DateInterval),
+        }));
+        const trainings = (trainingRows || []).map((r) => ({
+            name: _sanitizeHris(r.TrainingName),
+            type: _sanitizeHris(r.TrainingType),
+            organizer: _sanitizeHris(r.Organizer),
+            from: r.StartDate ? new Date(r.StartDate).toISOString() : null,
+            to: r.EndDate ? new Date(r.EndDate).toISOString() : null,
+            // `Other` often carries a fallback duration string ("for 3
+            // months") when From/To weren't filled. Mobile renders it as
+            // the duration line when both dates are null.
+            other: _sanitizeHris(r.Other),
         }));
         console.log(
-            `[GET /me/education] response: education=${education.length} certifications=${certifications.length}`
+            `[GET /me/education] response: education=${education.length} certifications=${certifications.length} trainings=${trainings.length}`
         );
-        return res.json({ error: false, education, certifications });
+        return res.json({ error: false, education, certifications, trainings });
     } catch (e) {
         console.error("GET /me/education error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });

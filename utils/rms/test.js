@@ -558,4 +558,126 @@ const getEmployeeCertifications = async (username, employeeId) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications };
+// HRIS lookup: the caller's address row, with Region resolved via the
+// luCity → luRegion chain. Returns a single object or null.
+//
+// `***` is a common form-placeholder in the legacy HR app for "skip this
+// field" — we strip it server-side so mobile / web don't have to. Caller
+// gets either a real value or "".
+const _sanitizeHris = (v) => {
+    if (v == null) return "";
+    const s = String(v).trim();
+    return s === '***' ? '' : s;
+};
+
+const getEmployeeAddress = async (username, employeeId) => {
+    try {
+        await sql.connect(dbConfig);
+
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
+            console.warn(
+                `[getEmployeeAddress] no UserId resolved for username='${username}' employeeId='${employeeId || '(none)'}'`
+            );
+            return null;
+        }
+
+        const req = new sql.Request();
+        req.input('userId', sql.Int, userId);
+        const query = `
+            SELECT TOP 1
+                r.[Name]      AS Region,
+                c.[Name]      AS City,
+                a.Zone        AS Zone,
+                a.Woreda      AS Woreda,
+                a.Kebele      AS Kebele,
+                a.SubCity     AS SubCity,
+                a.HouseNumber AS HouseNumber,
+                a.POBox       AS POBox,
+                a.Telephone   AS Telephone
+            FROM dbo.EmployeeAddress a
+            LEFT JOIN dbo.luCity   c ON c.Id = a.City
+            LEFT JOIN dbo.luRegion r ON r.Id = c.Region
+            WHERE a.UserId = @userId
+        `;
+        console.log(
+            '[getEmployeeAddress] SQL:',
+            query.replace(/\s+/g, ' ').trim(),
+            `(@userId=${userId})`
+        );
+        const result = await req.query(query);
+        const row = result.recordset && result.recordset[0];
+        console.log(
+            `[getEmployeeAddress] UserId=${userId} found=${row ? 'yes' : 'no'}`
+        );
+        if (row) console.log('[getEmployeeAddress] sample:', JSON.stringify(row));
+        return row || null;
+    } catch (e) {
+        console.error('[getEmployeeAddress] Error:', e.message, e.stack);
+        return null;
+    } finally {
+        await sql.close();
+    }
+};
+
+// HRIS lookup: every EmployeeTraining row for the caller, with the FK
+// lookup tables resolved. Sorted by [From] DESC then Id DESC, so the
+// most recent training appears first.
+//
+// `Documents` (varbinary cert blob) is deliberately not selected — the
+// profile screen doesn't need it and pulling MB-sized blobs over HTTP
+// for every Education-tab open would be wasteful.
+const getEmployeeTrainings = async (username, employeeId) => {
+    try {
+        await sql.connect(dbConfig);
+
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
+            console.warn(
+                `[getEmployeeTrainings] no UserId resolved for username='${username}' employeeId='${employeeId || '(none)'}'`
+            );
+            return [];
+        }
+
+        const req = new sql.Request();
+        req.input('userId', sql.Int, userId);
+        const query = `
+            SELECT
+                tn.[Name]    AS TrainingName,
+                tt.[Type]    AS TrainingType,
+                et.Organizer AS Organizer,
+                et.[From]    AS StartDate,
+                et.[To]      AS EndDate,
+                et.Other     AS Other
+            FROM dbo.EmployeeTraining et
+            LEFT JOIN dbo.luTrainingName tn ON tn.Id = et.TrainingName
+            LEFT JOIN dbo.luTrainingType tt ON tt.Id = et.TrainingType
+            WHERE et.UserId = @userId
+            ORDER BY et.[From] DESC, et.Id DESC
+        `;
+        console.log(
+            '[getEmployeeTrainings] SQL:',
+            query.replace(/\s+/g, ' ').trim(),
+            `(@userId=${userId})`
+        );
+        const result = await req.query(query);
+        const rows = result.recordset || [];
+        console.log(
+            `[getEmployeeTrainings] UserId=${userId} rows=${rows.length}`
+        );
+        if (rows.length > 0) {
+            console.log(
+                '[getEmployeeTrainings] sample:',
+                JSON.stringify(rows[0])
+            );
+        }
+        return rows;
+    } catch (e) {
+        console.error('[getEmployeeTrainings] Error:', e.message, e.stack);
+        return [];
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, _sanitizeHris };
