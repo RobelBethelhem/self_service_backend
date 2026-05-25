@@ -68,14 +68,18 @@ router.get("/me", auth, async (req, res) => {
         if (!user) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
-        // Two HRIS reads in parallel — identity + address. Address never
-        // blocks the response (best-effort, see catch handler on the
-        // helper) but it sits in /me so the Personal tab gets it without
-        // a second round-trip.
-        const [hr, addr] = await Promise.all([
-            getEmployeeIdentity(user.user).catch(() => null),
-            getEmployeeAddress(user.user, user.employee_id).catch(() => null),
-        ]);
+        // IMPORTANT — must be SEQUENTIAL awaits, NOT Promise.all.
+        //
+        // Each HRIS helper opens the mssql global pool with sql.connect()
+        // and closes it with sql.close() in its `finally`. The pool is
+        // process-wide and not ref-counted: when two helpers run in
+        // parallel, whichever finishes first calls sql.close() and tears
+        // down the pool that the slower one is still mid-query on. The
+        // slower one's request throws, gets swallowed by its try/catch,
+        // and returns null — silently. Running sequentially keeps each
+        // helper's pool lifecycle isolated.
+        const hr = await getEmployeeIdentity(user.user).catch(() => null);
+        const addr = await getEmployeeAddress(user.user, user.employee_id).catch(() => null);
         const profile = {
             first_name: (hr && hr.Name) || user.first_name || "",
             middle_name: (hr && hr.FName) || "",
@@ -207,15 +211,13 @@ router.get("/me/education", auth, async (req, res) => {
         console.log(
             `[GET /me/education] caller username='${user.user}' employeeId='${user.employee_id || '(none)'}' _id=${user._id}`
         );
-        // Three HRIS reads in parallel — education + certifications +
-        // trainings. All share the same UserId-resolution path inside
-        // the helpers, so a successful identity resolve cascades to all
-        // three. Each helper is independently best-effort.
-        const [eduRows, certRows, trainingRows] = await Promise.all([
-            getEmployeeEducation(user.user, user.employee_id).catch(() => []),
-            getEmployeeCertifications(user.user, user.employee_id).catch(() => []),
-            getEmployeeTrainings(user.user, user.employee_id).catch(() => []),
-        ]);
+        // Sequential, NOT Promise.all — see the long comment in /me for
+        // why. The mssql helpers close the global pool in their finally
+        // block; parallel calls race each other into a torn-down pool
+        // and silently return empty.
+        const eduRows = await getEmployeeEducation(user.user, user.employee_id).catch(() => []);
+        const certRows = await getEmployeeCertifications(user.user, user.employee_id).catch(() => []);
+        const trainingRows = await getEmployeeTrainings(user.user, user.employee_id).catch(() => []);
         const education = (eduRows || []).map((r) => ({
             level: r.EducationLevel || "",
             field: r.FieldOfStudy || "",
