@@ -205,8 +205,13 @@ const supportiveSchema =  new Schema({
     salary:{
         type: String,
         trim: true,
-    }
-    
+    },
+    // Admin's free-text reason when the request is moved to "Rejected".
+    rejection_reason: {
+        type: String,
+        trim: true,
+    },
+
     });
 
 

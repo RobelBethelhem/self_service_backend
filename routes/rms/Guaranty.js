@@ -1024,8 +1024,8 @@ router.patch("/view_request_guaranty", auth, roleCheck(["admin"]), async (req, r
 
 router.patch("/reject_request_guaranty", auth, roleCheck(["admin"]), async (req, res) => {
   try {
-    const { id } = req.body;
-    
+    const { id, rejection_reason } = req.body;
+
     if (!id) {
       return res.status(400).json({ error: true, message: "Request ID is required" });
     }
@@ -1059,7 +1059,8 @@ router.patch("/reject_request_guaranty", auth, roleCheck(["admin"]), async (req,
     const updateResult = await Guaranty.findByIdAndUpdate(id, {
       status: "Rejected",
       viewed_by: user.user,
-      viewed_date: new Date()
+      viewed_date: new Date(),
+      rejection_reason: rejection_reason || "No reason provided",
     }, { new: true });
 
     if (updateResult) {

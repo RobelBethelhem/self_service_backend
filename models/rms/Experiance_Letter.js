@@ -79,6 +79,13 @@ const experianceSchema = new Schema({
         trim: true,
     },
     experiences: [ExperienceItemSchema],
+    // Admin's free-text reason when the request is moved to "Rejected".
+    // Surfaced on the requester's mobile/web detail screen so they know
+    // why and can correct the next attempt.
+    rejection_reason: {
+        type: String,
+        trim: true,
+    },
 });
 
 const Experience = mongoose.model('Experience', experianceSchema);

@@ -75,7 +75,12 @@ const embassySchema = new Schema({
     TimeStamp:{
         type: Date,
         default: new Date()
-    }
+    },
+    // Admin's free-text reason when the request is moved to "Rejected".
+    rejection_reason: {
+        type: String,
+        trim: true,
+    },
 });
 
 const Embassy = mongoose.model('Embassy', embassySchema);

@@ -1147,7 +1147,7 @@ router.patch("/reject_request_experiance", auth, roleCheck(["admin"]), async (re
 
         request.status = "Rejected";
 
-        // request.rejection_reason = req.body.rejection_reason || "No reason provided";
+        request.rejection_reason = req.body.rejection_reason || "No reason provided";
 
 
 

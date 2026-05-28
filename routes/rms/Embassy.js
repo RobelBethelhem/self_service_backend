@@ -193,7 +193,7 @@ router.patch("/view_request_embassy", auth, roleCheck(["admin"]), async (req, re
 
 router.patch("/reject_request_embassy", auth, roleCheck(["admin"]), async (req, res) => {
   try {
-    const { id } = req.body;
+    const { id, rejection_reason } = req.body;
     const getUser = await req.user;
     const user = await User.findOne({ _id: getUser._id });
    
@@ -215,7 +215,7 @@ router.patch("/reject_request_embassy", auth, roleCheck(["admin"]), async (req, 
       status: "Rejected",
       viewed_by: user.user,
       viewed_date: new Date(),
-      
+      rejection_reason: rejection_reason || "No reason provided",
     }, { new: true });
 
     if (updateResult) {
