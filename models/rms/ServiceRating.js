@@ -15,7 +15,12 @@ const Schema = mongoose.Schema;
 // 1 = Strongly Disagree ... 5 = Strongly Agree
 const likert = {
     type: Number,
-    required: true,
+    // Required only for a real submission. When the policy for a letter type
+    // is "optional" the user may decline, and a declined row carries no
+    // scores at all — see `status` below.
+    required: function () {
+        return this.status !== "declined";
+    },
     min: 1,
     max: 5,
 };
@@ -37,6 +42,27 @@ const serviceRatingSchema = new Schema({
         enum: ["Experience", "Embassy", "Guranty", "Supportive", "Medical"],
     },
     reference_number: {
+        type: String,
+        trim: true,
+    },
+
+    // "submitted" -> the user answered Q1-Q4.
+    // "declined"  -> the policy was "optional" and the user chose not to rate.
+    //
+    // Declines are recorded rather than dropped for two reasons: HR gets a
+    // real response rate, and the user is not re-prompted on every reprint.
+    // Reports exclude them from averages with { status: { $ne: "declined" } }
+    // — a $ne test, not an equality test, so rows written before this field
+    // existed still count as submissions.
+    status: {
+        type: String,
+        enum: ["submitted", "declined"],
+        default: "submitted",
+    },
+
+    // The policy in force when this row was written, copied here so a later
+    // policy change cannot rewrite the meaning of historic data.
+    policy_mode: {
         type: String,
         trim: true,
     },
