@@ -8,6 +8,7 @@ import Embassy from "../../models/rms/Letter_of_Embassy.js";
 import Guaranty from "../../models/rms/Guaranty_Letter.js";
 import Supportive from "../../models/rms/Supportive_Letter.js";
 import Medical from "../../models/rms/Medical.js";
+import ServiceRatingPolicy, { RATING_MODES } from "../../models/rms/ServiceRatingPolicy.js";
 import { getRatingProfile } from "../../utils/rms/test.js";
 
 const router = Router();
@@ -72,6 +73,37 @@ const round2 = (n) =>
 
 const normaliseType = (raw) => CANONICAL_TYPE[String(raw || "").toLowerCase()] || null;
 
+// ---------------------------------------------------------------------------
+// Policy resolution
+// ---------------------------------------------------------------------------
+// A letter type with NO policy row resolves to "mandatory" — precisely how the
+// survey behaved before policies existed. Nothing changes until an admin
+// deliberately opts a type into something else.
+const DEFAULT_MODE = "mandatory";
+
+// Inside the effective window the configured `mode` applies; outside it the
+// `fallback_mode` does. Without a fallback, a campaign that ends would leave
+// the next day undefined.
+const resolvePolicyMode = (policy, now = new Date()) => {
+    if (!policy) return DEFAULT_MODE;
+    const from = policy.effective_from ? new Date(policy.effective_from) : null;
+    const to = policy.effective_to ? new Date(policy.effective_to) : null;
+    if (from && now < from) return policy.fallback_mode || "optional";
+    if (to && now > to) return policy.fallback_mode || "optional";
+    return policy.mode || DEFAULT_MODE;
+};
+
+// Never let a policy lookup failure block a print — fall back to the default.
+const modeFor = async (request_type) => {
+    let policy = null;
+    try {
+        policy = await ServiceRatingPolicy.findOne({ request_type }).lean();
+    } catch (e) {
+        console.error("[service-rating] policy lookup failed:", e.message);
+    }
+    return { policy: policy || null, mode: resolvePolicyMode(policy) };
+};
+
 const clientIpOf = (req) => {
     // IIS sits in front of node, so the real client address arrives in
     // x-forwarded-for — same handling as SalaryIncrement's audit fields.
@@ -110,10 +142,26 @@ router.get("/status", auth, roleCheck(["user", "admin"]), async (req, res) => {
             domain_user: ciExact(user.user),
         }).lean();
 
+        // Bundled so the gate resolves "must I ask, and how?" in one call.
+        const { policy, mode } = await modeFor(request_type);
+
         return res.json({
             error: false,
+            // A recorded decline counts as answered: the user already said no,
+            // so they are not re-prompted on every reprint.
             rated: !!rating,
             rating: rating || null,
+            mode,
+            policy: policy
+                ? {
+                      request_type: policy.request_type,
+                      mode: policy.mode,
+                      effective_from: policy.effective_from,
+                      effective_to: policy.effective_to,
+                      fallback_mode: policy.fallback_mode,
+                      resolved_mode: mode,
+                  }
+                : { request_type, mode: DEFAULT_MODE, resolved_mode: mode },
         });
     } catch (error) {
         console.error("[service-rating] /status error:", error);
@@ -153,6 +201,85 @@ router.get("/questions", auth, roleCheck(["user", "admin"]), (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Shared gate for /submit and /decline
+// ---------------------------------------------------------------------------
+// Both endpoints must apply the SAME owner and state checks. Keeping them in
+// one function means a fix to the ownership rule can never land on only one of
+// the two paths.
+//
+// Returns { status, message } when the request must be rejected, otherwise
+// { user, letter, existing }.
+const resolveRatableRequest = async (req, request_type, request_id) => {
+    const user = await User.findOne({ _id: req.user._id });
+    if (!user) {
+        return { status: 400, message: "The requester cannot be found" };
+    }
+
+    const Model = LETTER_MODELS[request_type];
+    const letter = await Model.findById(request_id).catch(() => null);
+    if (!letter) {
+        return { status: 404, message: "Request not found" };
+    }
+
+    // Owner-only: you rate the service YOU received. An admin printing
+    // someone else's letter is not a service recipient.
+    if (
+        String(letter.domain_user).toLowerCase() !== String(user.user).toLowerCase()
+    ) {
+        return { status: 403, message: "You can only rate your own request" };
+    }
+
+    // Only an issued letter has a service experience worth rating.
+    if (letter.status !== "Viewed") {
+        return {
+            status: 400,
+            message: `Request is in status "${letter.status}" and cannot be rated`,
+        };
+    }
+
+    const existing = await ServiceRating.findOne({ request_type, request_id }).lean();
+    return { user, letter, existing };
+};
+
+// Fields common to a submission and a decline, including the HRIS snapshot.
+// HRIS is best-effort — a rating must never be lost because that box is
+// unreachable, so this never throws upward.
+const buildRatingBase = async ({ req, user, letter, request_type, request_id, mode }) => {
+    const profile = await getRatingProfile(user.user, user.employee_id).catch(() => null);
+
+    // Medical reuses employee_first_name for the dependent's name, so prefer
+    // the Mongo User profile for the rater's own name.
+    const employeeName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+
+    return {
+        request_id,
+        request_type,
+        reference_number: letter.reference_number || "",
+        domain_user: user.user,
+        employee_name: employeeName,
+        employee_id: (profile && profile.employee_id) || user.employee_id || "",
+        approved_by: letter.viewed_by || "",
+        approved_date: letter.viewed_date || null,
+        policy_mode: mode,
+        gender: (profile && profile.gender) || "",
+        age: profile ? profile.age : null,
+        job_grade: (profile && profile.job_grade) || "",
+        department: (profile && profile.department) || "",
+        place_of_assignment: (profile && profile.place_of_assignment) || "",
+        current_position: (profile && profile.current_position) || "",
+        experience_years: profile ? profile.experience_years : null,
+        experience_months: profile ? profile.experience_months : null,
+        experience_days: profile ? profile.experience_days : null,
+        experience_total_days: profile ? profile.experience_total_days : null,
+        experience_text: (profile && profile.experience_text) || "",
+        employment_date: (profile && profile.employment_date) || null,
+        submitted_at: new Date(),
+        user_agent: req.headers["user-agent"] || "",
+        ip: clientIpOf(req),
+    };
+};
+
+// ---------------------------------------------------------------------------
 // POST /submit
 // ---------------------------------------------------------------------------
 // Owner-only. Idempotent: a second submit for an already-rated request
@@ -188,45 +315,14 @@ router.post("/submit", auth, roleCheck(["user", "admin"]), async (req, res) => {
         // Q5 optional — an empty/absent value is a legitimate skip.
         const suggestion = String(body.q5_suggestion || "").trim().slice(0, 2000);
 
-        const user = await User.findOne({ _id: req.user._id });
-        if (!user) {
+        const resolved = await resolveRatableRequest(req, request_type, request_id);
+        if (resolved.status) {
             return res
-                .status(400)
-                .json({ error: true, message: "The requester cannot be found" });
+                .status(resolved.status)
+                .json({ error: true, message: resolved.message });
         }
+        const { user, letter, existing } = resolved;
 
-        const Model = LETTER_MODELS[request_type];
-        const letter = await Model.findById(request_id).catch(() => null);
-        if (!letter) {
-            return res
-                .status(404)
-                .json({ error: true, message: "Request not found" });
-        }
-
-        // Owner-only: you rate the service YOU received. An admin printing
-        // someone else's letter is not a service recipient.
-        if (
-            String(letter.domain_user).toLowerCase() !==
-            String(user.user).toLowerCase()
-        ) {
-            return res.status(403).json({
-                error: true,
-                message: "You can only rate your own request",
-            });
-        }
-
-        // Only an issued letter has a service experience worth rating.
-        if (letter.status !== "Viewed") {
-            return res.status(400).json({
-                error: true,
-                message: `Request is in status "${letter.status}" and cannot be rated`,
-            });
-        }
-
-        const existing = await ServiceRating.findOne({
-            request_type,
-            request_id,
-        }).lean();
         if (existing) {
             return res.json({
                 error: false,
@@ -236,50 +332,27 @@ router.post("/submit", auth, roleCheck(["user", "admin"]), async (req, res) => {
             });
         }
 
-        // HRIS snapshot — best effort. A rating must never be lost because
-        // the HRIS box is unreachable, so this never throws upward.
-        const profile = await getRatingProfile(user.user, user.employee_id).catch(
-            () => null
-        );
-
-        // Medical reuses employee_first_name for the dependent's name, so
-        // prefer the Mongo User profile for the rater's own name.
-        const employeeName = [user.first_name, user.last_name]
-            .filter(Boolean)
-            .join(" ")
-            .trim();
+        const { mode } = await modeFor(request_type);
 
         const average =
             QUESTION_KEYS.reduce((sum, k) => sum + answers[k], 0) /
             QUESTION_KEYS.length;
 
-        const doc = new ServiceRating({
-            request_id,
+        const base = await buildRatingBase({
+            req,
+            user,
+            letter,
             request_type,
-            reference_number: letter.reference_number || "",
-            domain_user: user.user,
-            employee_name: employeeName,
-            employee_id: (profile && profile.employee_id) || user.employee_id || "",
+            request_id,
+            mode,
+        });
+
+        const doc = new ServiceRating({
+            ...base,
+            status: "submitted",
             ...answers,
             q5_suggestion: suggestion,
             average_score: round2(average),
-            approved_by: letter.viewed_by || "",
-            approved_date: letter.viewed_date || null,
-            gender: (profile && profile.gender) || "",
-            age: profile ? profile.age : null,
-            job_grade: (profile && profile.job_grade) || "",
-            department: (profile && profile.department) || "",
-            place_of_assignment: (profile && profile.place_of_assignment) || "",
-            current_position: (profile && profile.current_position) || "",
-            experience_years: profile ? profile.experience_years : null,
-            experience_months: profile ? profile.experience_months : null,
-            experience_days: profile ? profile.experience_days : null,
-            experience_total_days: profile ? profile.experience_total_days : null,
-            experience_text: (profile && profile.experience_text) || "",
-            employment_date: (profile && profile.employment_date) || null,
-            submitted_at: new Date(),
-            user_agent: req.headers["user-agent"] || "",
-            ip: clientIpOf(req),
         });
 
         try {
@@ -310,6 +383,280 @@ router.post("/submit", auth, roleCheck(["user", "admin"]), async (req, res) => {
         });
     } catch (error) {
         console.error("[service-rating] /submit error:", error);
+        return res
+            .status(500)
+            .json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /decline
+// ---------------------------------------------------------------------------
+// Only meaningful when the letter type's policy resolves to "optional": the
+// user was asked whether they wanted to rate and said no.
+//
+// The decline is RECORDED rather than dropped. It gives HR a real response
+// rate, and it stops the user being re-prompted every time they reprint the
+// same letter. Reports exclude these rows from averages.
+router.post("/decline", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const body = req.body || {};
+        const request_type = normaliseType(body.request_type);
+        const request_id = body.request_id ? String(body.request_id) : null;
+
+        if (!request_id || !request_type) {
+            return res.status(400).json({
+                error: true,
+                message: "request_id and a valid request_type are required",
+            });
+        }
+
+        const resolved = await resolveRatableRequest(req, request_type, request_id);
+        if (resolved.status) {
+            return res
+                .status(resolved.status)
+                .json({ error: true, message: resolved.message });
+        }
+        const { user, letter, existing } = resolved;
+
+        if (existing) {
+            return res.json({
+                error: false,
+                already: true,
+                message: "This request has already been answered",
+                rating: existing,
+            });
+        }
+
+        const { mode } = await modeFor(request_type);
+
+        // Declining a survey the admin made compulsory is not a user decision
+        // to make. The frontend never offers the option in this mode, so this
+        // only catches a stale client or a hand-crafted request.
+        if (mode === "mandatory") {
+            return res.status(400).json({
+                error: true,
+                message: "Rating is mandatory for this letter type and cannot be skipped",
+            });
+        }
+
+        const base = await buildRatingBase({
+            req,
+            user,
+            letter,
+            request_type,
+            request_id,
+            mode,
+        });
+
+        const doc = new ServiceRating({
+            ...base,
+            status: "declined",
+            q5_suggestion: "",
+            average_score: null,
+        });
+
+        try {
+            await doc.save();
+        } catch (e) {
+            if (e && e.code === 11000) {
+                const winner = await ServiceRating.findOne({
+                    request_type,
+                    request_id,
+                }).lean();
+                return res.json({
+                    error: false,
+                    already: true,
+                    message: "This request has already been answered",
+                    rating: winner,
+                });
+            }
+            throw e;
+        }
+
+        return res.json({
+            error: false,
+            already: false,
+            declined: true,
+            message: "No problem — continuing without a rating",
+            rating: doc.toObject(),
+        });
+    } catch (error) {
+        console.error("[service-rating] /decline error:", error);
+        return res
+            .status(500)
+            .json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Admin policy management
+// ---------------------------------------------------------------------------
+
+const ALL_TYPES = Object.keys(LETTER_MODELS);
+
+// GET /admin/policy
+// Every letter type, whether or not it has a saved row. Types without one are
+// returned as implicit defaults so the admin screen can render all five
+// without the backend writing rows nobody asked for.
+router.get("/admin/policy", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const saved = await ServiceRatingPolicy.find().lean();
+        const byType = {};
+        saved.forEach((p) => {
+            byType[p.request_type] = p;
+        });
+
+        const policies = ALL_TYPES.map((request_type) => {
+            const p = byType[request_type];
+            if (!p) {
+                return {
+                    request_type,
+                    mode: DEFAULT_MODE,
+                    effective_from: null,
+                    effective_to: null,
+                    fallback_mode: "optional",
+                    note: "",
+                    configured: false,
+                    resolved_mode: DEFAULT_MODE,
+                    updated_by: null,
+                    updated_at: null,
+                    history: [],
+                };
+            }
+            return {
+                ...p,
+                configured: true,
+                resolved_mode: resolvePolicyMode(p),
+            };
+        });
+
+        return res.json({ error: false, modes: RATING_MODES, policies });
+    } catch (error) {
+        console.error("[service-rating] /admin/policy error:", error);
+        return res
+            .status(500)
+            .json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// PUT /admin/policy
+// Upsert one letter type's policy and append the new state to its history.
+router.put("/admin/policy", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const body = req.body || {};
+        const request_type = normaliseType(body.request_type);
+        if (!request_type) {
+            return res
+                .status(400)
+                .json({ error: true, message: "A valid request_type is required" });
+        }
+
+        const mode = String(body.mode || "").toLowerCase();
+        if (!RATING_MODES.includes(mode)) {
+            return res.status(400).json({
+                error: true,
+                message: `mode must be one of: ${RATING_MODES.join(", ")}`,
+            });
+        }
+
+        const fallbackRaw = String(body.fallback_mode || "optional").toLowerCase();
+        const fallback_mode = RATING_MODES.includes(fallbackRaw) ? fallbackRaw : "optional";
+
+        const parseDate = (value, endOfDay) => {
+            if (!value) return null;
+            const d = new Date(value);
+            if (Number.isNaN(d.getTime())) return null;
+            // A window ending "31 Mar" must cover all of 31 Mar, so the end
+            // bound is pushed to the last millisecond of that day here rather
+            // than complicating every read.
+            if (endOfDay) d.setHours(23, 59, 59, 999);
+            return d;
+        };
+
+        const effective_from = parseDate(body.effective_from, false);
+        const effective_to = parseDate(body.effective_to, true);
+
+        if (effective_from && effective_to && effective_to < effective_from) {
+            return res.status(400).json({
+                error: true,
+                message: "effective_to cannot be earlier than effective_from",
+            });
+        }
+
+        const user = await User.findOne({ _id: req.user._id });
+        const changedBy = (user && user.user) || "unknown";
+        const note = String(body.note || "").trim().slice(0, 500);
+        const now = new Date();
+
+        const historyEntry = {
+            mode,
+            effective_from,
+            effective_to,
+            fallback_mode,
+            note,
+            changed_by: changedBy,
+            changed_at: now,
+        };
+
+        const policy = await ServiceRatingPolicy.findOneAndUpdate(
+            { request_type },
+            {
+                $set: {
+                    request_type,
+                    mode,
+                    effective_from,
+                    effective_to,
+                    fallback_mode,
+                    note,
+                    updated_by: changedBy,
+                    updated_at: now,
+                },
+                $setOnInsert: { created_by: changedBy, created_at: now },
+                $push: { history: historyEntry },
+            },
+            { new: true, upsert: true, setDefaultsOnInsert: true }
+        ).lean();
+
+        console.log(
+            `[service-rating] policy ${request_type} -> ${mode} ` +
+            `(from=${effective_from || "-"} to=${effective_to || "-"} fallback=${fallback_mode}) by ${changedBy}`
+        );
+
+        return res.json({
+            error: false,
+            message: `Rating policy for ${request_type} updated`,
+            policy: { ...policy, configured: true, resolved_mode: resolvePolicyMode(policy) },
+        });
+    } catch (error) {
+        console.error("[service-rating] PUT /admin/policy error:", error);
+        return res
+            .status(500)
+            .json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// GET /admin/policy/history
+// Flattened change log across every letter type, newest first.
+router.get("/admin/policy/history", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const filter = {};
+        const type = normaliseType(req.query && req.query.request_type);
+        if (type) filter.request_type = type;
+
+        const policies = await ServiceRatingPolicy.find(filter).lean();
+
+        const entries = [];
+        policies.forEach((p) => {
+            (p.history || []).forEach((h) => {
+                entries.push({ request_type: p.request_type, ...h });
+            });
+        });
+        entries.sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at));
+
+        return res.json({ error: false, data: entries, meta: { totalRowCount: entries.length } });
+    } catch (error) {
+        console.error("[service-rating] /admin/policy/history error:", error);
         return res
             .status(500)
             .json({ error: true, message: "Internal Server Error" });
@@ -388,6 +735,9 @@ const groupAccumulators = () => {
     }
     return acc;
 };
+
+// Declines carry no scores, so they must never reach an $avg.
+const SUBMITTED_ONLY = { $match: { status: { $ne: "declined" } } };
 
 // Flat accumulator keys -> nested per-question shape the dashboard renders.
 const reshapeGroup = (row) => {
@@ -488,34 +838,51 @@ router.get("/admin/summary", auth, roleCheck(["admin"]), async (req, res) => {
             },
             {
                 $facet: {
-                    overall: [{ $group: { _id: null, ...acc } }],
+                    // Every statistical branch drops declines first. The test
+                    // is $ne rather than an equality check on "submitted" so
+                    // rows written before the status field existed still count.
+                    overall: [SUBMITTED_ONLY, { $group: { _id: null, ...acc } }],
                     by_approver: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$approved_by", ...acc } },
                         { $sort: { count: -1 } },
                     ],
                     by_request_type: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$request_type", ...acc } },
                         { $sort: { count: -1 } },
                     ],
                     by_department: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$department", ...acc } },
                         { $sort: { count: -1 } },
                     ],
                     by_gender: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$gender", ...acc } },
                         { $sort: { count: -1 } },
                     ],
                     by_job_grade: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$job_grade", ...acc } },
                         { $sort: { count: -1 } },
                     ],
                     by_age_band: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$age_band", ...acc } },
                         { $sort: { _id: 1 } },
                     ],
                     by_experience_band: [
+                        SUBMITTED_ONLY,
                         { $group: { _id: "$experience_band", ...acc } },
                         { $sort: { _id: 1 } },
+                    ],
+                    // Counted, never averaged — a decline has no scores.
+                    declined: [{ $match: { status: "declined" } }, { $count: "n" }],
+                    declined_by_request_type: [
+                        { $match: { status: "declined" } },
+                        { $group: { _id: "$request_type", count: { $sum: 1 } } },
+                        { $sort: { count: -1 } },
                     ],
                 },
             },
@@ -526,12 +893,26 @@ router.get("/admin/summary", auth, roleCheck(["admin"]), async (req, res) => {
 
         const list = (name) => (facet[name] || []).map(reshapeGroup).filter(Boolean);
 
+        const overallRow = reshapeGroup((facet.overall || [])[0]);
+        const declined = ((facet.declined || [])[0] || {}).n || 0;
+        const submitted = overallRow ? overallRow.count : 0;
+        const asked = submitted + declined;
+
         return res.json({
             error: false,
             scale: SCALE_LABELS,
+            // Only meaningful where the policy is "optional" — under a
+            // mandatory policy there is nothing to decline, so this reads 100%.
+            declined,
+            asked,
+            response_rate: asked ? Math.round((submitted / asked) * 100) : null,
+            declined_by_request_type: (facet.declined_by_request_type || []).map((r) => ({
+                key: r._id || "(unspecified)",
+                count: r.count,
+            })),
             question_labels: QUESTION_LABELS,
             question_purpose: QUESTION_PURPOSE,
-            overall: reshapeGroup((facet.overall || [])[0]) || {
+            overall: overallRow || {
                 key: "overall",
                 count: 0,
                 comments: 0,
