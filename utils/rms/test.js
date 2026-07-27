@@ -680,4 +680,214 @@ const getEmployeeTrainings = async (username, employeeId) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, _sanitizeHris };
+// ---------------------------------------------------------------------------
+// Service-rating demographics
+// ---------------------------------------------------------------------------
+// Snapshot of the rater's HRIS profile, captured at the moment a service
+// rating is submitted. HR slices satisfaction by gender / age / job grade /
+// department / tenure, and the snapshot means those reports stay stable even
+// after the employee is promoted or transferred.
+//
+// Both queries run inside ONE connect/close on purpose. Every helper in this
+// file owns its own sql.connect + sql.close, so firing them concurrently
+// (Promise.all) exhausts the mssql pool — the same trap that forced the
+// serialization fix in routes/rms/auth.js. Two sequential requests on one
+// open connection is both faster and safer.
+
+// Internal-experience span, expressed as years + months + days.
+//
+// Measures MIN([From]) .. MAX([To]) across the employee's internal
+// experience rows — i.e. continuous tenure at the bank, NOT the sum of each
+// position's day count. An employee who held four positions back-to-back
+// since 1 Feb 2024 reads "2 years, 5 months and 26 days", not the 904 days
+// those four rows add up to. Tenure is what HR wants here.
+//
+// `useLookupTable` picks how "Internal" is identified:
+//   true  -> JOIN luExperienceType ON t.ExpType = 'Internal'  (preferred)
+//   false -> e.ExperienceType = 1                             (fallback)
+// The rest of this file hardcodes the magic number 1; the lookup-table join
+// is more robust but assumes luExperienceType exists in this HRIS instance.
+// The caller tries the join first and falls back on SQL error.
+const _internalExperienceSpan = async (userId, useLookupTable) => {
+    const source = useLookupTable
+        ? `FROM dbo.EmployeeExperience e
+           JOIN dbo.luExperienceType t ON t.Id = e.ExperienceType
+           WHERE e.UserId = @userId AND t.ExpType = 'Internal'`
+        : `FROM dbo.EmployeeExperience e
+           WHERE e.UserId = @userId AND e.ExperienceType = 1`;
+
+    const query = `
+        WITH ex AS (
+            SELECT e.[From] AS StartDate,
+                   COALESCE(e.[To], CAST(GETDATE() AS date)) AS EndDate
+            ${source}
+        ),
+        span AS (
+            SELECT MIN(StartDate) AS S, MAX(EndDate) AS E FROM ex
+        ),
+        y AS (
+            SELECT S, E,
+                   DATEDIFF(YEAR, S, E)
+                     - CASE WHEN DATEADD(YEAR, DATEDIFF(YEAR, S, E), S) > E THEN 1 ELSE 0 END AS Yrs
+            FROM span
+            WHERE S IS NOT NULL AND E IS NOT NULL
+        ),
+        m AS (
+            SELECT S, E, Yrs, DATEADD(YEAR, Yrs, S) AS A1 FROM y
+        ),
+        m2 AS (
+            SELECT S, E, Yrs, A1,
+                   DATEDIFF(MONTH, A1, E)
+                     - CASE WHEN DATEADD(MONTH, DATEDIFF(MONTH, A1, E), A1) > E THEN 1 ELSE 0 END AS Mons
+            FROM m
+        )
+        SELECT Yrs                                          AS Years,
+               Mons                                         AS Months,
+               DATEDIFF(DAY, DATEADD(MONTH, Mons, A1), E)   AS Days,
+               DATEDIFF(DAY, S, E)                          AS TotalDays,
+               S                                            AS FirstStart,
+               E                                            AS LastEnd
+        FROM m2
+    `;
+
+    const req = new sql.Request();
+    req.input('userId', sql.Int, userId);
+    const result = await req.query(query);
+    return (result.recordset && result.recordset[0]) || null;
+};
+
+// Human-readable tenure, matching the phrasing HR uses in reports.
+const _formatExperience = (span) => {
+    if (!span) return "";
+    const y = Number(span.Years) || 0;
+    const m = Number(span.Months) || 0;
+    const d = Number(span.Days) || 0;
+    const parts = [];
+    if (y > 0) parts.push(`${y} year${y === 1 ? "" : "s"}`);
+    if (m > 0) parts.push(`${m} month${m === 1 ? "" : "s"}`);
+    parts.push(`${d} day${d === 1 ? "" : "s"}`);
+    if (parts.length === 1) return parts[0];
+    return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+};
+
+const getRatingProfile = async (username, employeeId) => {
+    const empty = {
+        gender: "",
+        age: null,
+        job_grade: "",
+        department: "",
+        place_of_assignment: "",
+        current_position: "",
+        employee_id: _sanitizeHris(employeeId),
+        experience_years: null,
+        experience_months: null,
+        experience_days: null,
+        experience_total_days: null,
+        experience_text: "",
+        employment_date: null,
+    };
+
+    try {
+        await sql.connect(dbConfig);
+
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
+            console.warn(
+                `[getRatingProfile] no UserId resolved for username='${username}' employeeId='${employeeId || '(none)'}'`
+            );
+            return empty;
+        }
+
+        // --- Query 1: gender, age, job grade, department -------------------
+        // Age uses the birthday-adjusted DATEDIFF form so someone whose
+        // birthday has not landed yet this year is not aged up a year early.
+        const demoReq = new sql.Request();
+        demoReq.input('userId', sql.Int, userId);
+        const demoResult = await demoReq.query(`
+            SELECT TOP 1
+                a.[Sex]            AS Sex,
+                a.[DateOfBirth]    AS DateOfBirth,
+                a.[EmployeeId]     AS EmployeeId,
+                a.[EmploymentDate] AS EmploymentDate,
+                CASE WHEN a.[DateOfBirth] IS NULL THEN NULL ELSE
+                    DATEDIFF(YEAR, a.[DateOfBirth], GETDATE())
+                      - CASE WHEN DATEADD(YEAR, DATEDIFF(YEAR, a.[DateOfBirth], GETDATE()), a.[DateOfBirth]) > GETDATE()
+                             THEN 1 ELSE 0 END
+                END                AS Age,
+                le.[Postion]       AS CurrentPosition,
+                le.GradeName       AS JobGrade,
+                le.DeptName        AS Department
+            FROM dbo.EmployeeDetail a
+            OUTER APPLY (
+                SELECT TOP 1
+                    p.[Postion],
+                    g.[Name]    AS GradeName,
+                    dept.[Name] AS DeptName
+                FROM dbo.EmployeeExperience e
+                JOIN dbo.luPosition p ON p.Id = e.Position
+                LEFT JOIN dbo.luJobGrade g ON g.Id = p.Grade
+                LEFT JOIN dbo.luDepartment dept ON dept.Id = p.Department
+                WHERE e.UserId = a.UserId
+                  AND e.ExperienceType = 1
+                ORDER BY
+                    CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END,
+                    e.[From] DESC
+            ) le
+            WHERE a.UserId = @userId
+        `);
+        const demo = (demoResult.recordset && demoResult.recordset[0]) || {};
+
+        // --- Query 2: internal experience span -----------------------------
+        // Preferred form joins luExperienceType; fall back to the magic
+        // number the rest of this file uses if that table is absent.
+        let span = null;
+        try {
+            span = await _internalExperienceSpan(userId, true);
+        } catch (e) {
+            console.warn(
+                '[getRatingProfile] luExperienceType join failed, falling back to ExperienceType=1:',
+                e.message
+            );
+            try {
+                span = await _internalExperienceSpan(userId, false);
+            } catch (e2) {
+                console.error('[getRatingProfile] experience span failed:', e2.message);
+            }
+        }
+
+        // luDepartment is what getPlaceOfAssignment already surfaces (it
+        // aliases the department name as "PositionName"), so department and
+        // place of assignment resolve to the same HRIS value. Both are stored
+        // so reports can group by either label without a migration later.
+        const department = _sanitizeHris(demo.Department);
+
+        const profile = {
+            gender: _sanitizeHris(demo.Sex),
+            age: demo.Age == null ? null : Number(demo.Age),
+            job_grade: _sanitizeHris(demo.JobGrade),
+            department,
+            place_of_assignment: department,
+            current_position: _sanitizeHris(demo.CurrentPosition),
+            employee_id: _sanitizeHris(demo.EmployeeId) || _sanitizeHris(employeeId),
+            experience_years: span ? Number(span.Years) : null,
+            experience_months: span ? Number(span.Months) : null,
+            experience_days: span ? Number(span.Days) : null,
+            experience_total_days: span ? Number(span.TotalDays) : null,
+            experience_text: _formatExperience(span),
+            employment_date: demo.EmploymentDate || null,
+        };
+
+        console.log(
+            `[getRatingProfile] UserId=${userId} sex='${profile.gender}' age=${profile.age} ` +
+            `grade='${profile.job_grade}' dept='${profile.department}' exp='${profile.experience_text}'`
+        );
+        return profile;
+    } catch (e) {
+        console.error('[getRatingProfile] Error:', e.message, e.stack);
+        return empty;
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, getRatingProfile, _sanitizeHris };
