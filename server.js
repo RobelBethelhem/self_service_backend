@@ -39,7 +39,18 @@ import cors from "cors"
 
 
 const app = express();
-app.use(cors())
+// app.use(cors())
+
+app.use(
+  cors({
+    origin: [
+      "https://zhr.zemenbank.com",
+      "https://aps2.zemenbank.com"
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    credentials: true
+  })
+);
 
 
 // const corsOptions = {
@@ -78,16 +89,16 @@ dbConnect();
 
 app.use(express.json()); // Parse incoming requests data
 
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
-    res.header('Access-Control-Max-Age', '86400');
-    return res.sendStatus(200);
-  }
-  next();
-});
+// app.use((req, res, next) => {
+//  if (req.method === 'OPTIONS') {
+//    res.header('Access-Control-Allow-Origin', '*');
+//    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+//    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+//    res.header('Access-Control-Max-Age', '86400');
+//    return res.sendStatus(200);
+//  }
+//  next();
+// });
 
 
 
