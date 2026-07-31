@@ -72,10 +72,26 @@ const medicalSchema = new Schema({
         required: true,
         trim: true,
     },
-    place_of_assignment: { 
+    place_of_assignment: {
         type: String,
         required: true,
         trim: true,
+    },
+    // Where place_of_assignment came from.
+    //
+    // "hris"   - read from the HRIS record, the normal case.
+    // "manual" - HRIS had no value for this employee (a known data-cleansing
+    //            gap), so the employee typed it in to avoid being blocked.
+    //            The approver sees it flagged and is expected to verify it and
+    //            fix the HRIS record. Re-checked at approval time, so once HR
+    //            cleans the record the value and this flag correct themselves.
+    //
+    // Defaults to "hris" so requests written before this field existed keep
+    // reading as HRIS-sourced rather than showing a false warning.
+    place_of_assignment_source: {
+        type: String,
+        enum: ["hris", "manual"],
+        default: "hris",
     },
     domain_user: {
         type: String,
