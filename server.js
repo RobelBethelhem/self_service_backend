@@ -23,6 +23,7 @@ import MedicalProviderRoutes from "./routes/rms/MedicalProvider.js"
 import SalaryIncrement from "./routes/rms/SalaryIncrement.js"
 import ServiceRating from "./routes/rms/ServiceRating.js"
 import AnnouncementRoutes from "./routes/rms/Announcement.js"
+import HrisReportRoutes from "./routes/rms/HrisReport.js"
 
 
 
@@ -896,6 +897,7 @@ app.use("/zbss/api/users", userRoutes);
   app.use("/zbss/api/salary-increment", SalaryIncrement);
   app.use("/zbss/api/service-rating", ServiceRating);
   app.use("/zbss/api/announcement", AnnouncementRoutes);
+  app.use("/zbss/api/hris-report", HrisReportRoutes);
 
  
   
