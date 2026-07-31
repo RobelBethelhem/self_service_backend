@@ -2,8 +2,119 @@ import { Router } from "express";
 import auth from "../../middleware/rms/auth.js";
 import roleCheck from "../../middleware/rms/roleCheck.js";
 import { getReportPool, sql } from "../../utils/rms/hrisReportPool.js";
+import {
+    DIMENSION_NAMES,
+    FILTER_OPTIONS_SQL,
+    applyParams as applyLiveParams,
+    buildDetail,
+    buildSummary,
+    buildSummaryTotal,
+    buildPivotCells,
+    buildMovement,
+    buildDimensionValues,
+} from "../../utils/rms/hrisLiveQuery.js";
 
 const router = Router();
+
+// ---------------------------------------------------------------------------
+// Engine selection
+// ---------------------------------------------------------------------------
+// "live"      - the definitions are sent inline with every query. Needs nothing
+//               installed in HRIS and always reads current data. THE DEFAULT.
+// "installed" - calls the stored procedures from HRIS_Reporting.sql, which read
+//               a nightly snapshot. Faster (~0.7 ms vs ~23 ms) but only as
+//               fresh as the last refresh, and it has to be installed first.
+//
+// Live is the default because installing the pack needs CREATE rights in HRIS
+// that the portal's login does not have, and because "as of last night" is a
+// surprising thing for a report screen to mean unless you asked for it.
+const DEFAULT_ENGINE = "live";
+
+// OBJECT_ID never throws for a missing object, so this is safe against an
+// untouched database. Cached briefly so a page of reports does not re-ask.
+let packCache = { at: 0, core: false, reports: false, snapshot: false, movement: false };
+
+const packStatus = async (pool, force) => {
+    if (!force && Date.now() - packCache.at < 60000) return packCache;
+    const r = await pool.request().query(`
+        SELECT
+              Core     = CASE WHEN OBJECT_ID('dbo.usp_EmployeeReport_Detail','P') IS NULL THEN 0 ELSE 1 END
+            , Reports  = CASE WHEN OBJECT_ID('dbo.usp_Report_Turnover','P')       IS NULL THEN 0 ELSE 1 END
+            , Snapshot = CASE WHEN OBJECT_ID('dbo.EmployeeReportSnapshot','U')    IS NULL THEN 0 ELSE 1 END
+            , Movement = CASE WHEN OBJECT_ID('dbo.EmployeeMovementSnapshot','U')  IS NULL THEN 0 ELSE 1 END
+    `);
+    const row = (r.recordset && r.recordset[0]) || {};
+    packCache = {
+        at: Date.now(),
+        core: !!row.Core,
+        reports: !!row.Reports,
+        snapshot: !!row.Snapshot,
+        movement: !!row.Movement,
+    };
+    return packCache;
+};
+
+// Explicit request wins; otherwise live. Falling back to live when the caller
+// asks for "installed" against a database without the pack keeps a saved view
+// working rather than erroring.
+const chooseEngine = async (pool, body) => {
+    const asked = String((body && body.Engine) || DEFAULT_ENGINE).toLowerCase();
+    if (asked === "installed") {
+        const st = await packStatus(pool);
+        return st.core ? "installed" : "live";
+    }
+    return "live";
+};
+
+const runLive = async (pool, built) => {
+    const request = pool.request();
+    applyLiveParams(request, built.params);
+    return request.query(built.text);
+};
+
+// The live pivot returns one row per cell; the grid is assembled here rather
+// than with dynamic SQL, so no identifier is ever built from a string.
+const assemblePivot = (cells, rowDimension) => {
+    const colOrder = new Map();
+    cells.forEach((c) => {
+        if (!colOrder.has(c.ColLabel)) colOrder.set(c.ColLabel, c.ColSort);
+    });
+    const columns = Array.from(colOrder.entries())
+        .sort((a, b) => {
+            const sa = a[1] == null ? 2147483647 : a[1];
+            const sb = b[1] == null ? 2147483647 : b[1];
+            if (sa !== sb) return sa - sb;
+            return String(a[0]).localeCompare(String(b[0]));
+        })
+        .map((e) => e[0]);
+
+    const byRow = new Map();
+    cells.forEach((c) => {
+        if (!byRow.has(c.RowLabel)) {
+            const blank = { [rowDimension]: c.RowLabel, __sort: c.RowSort };
+            columns.forEach((col) => {
+                blank[col] = null;
+            });
+            byRow.set(c.RowLabel, blank);
+        }
+        byRow.get(c.RowLabel)[c.ColLabel] = c.Val;
+    });
+
+    const rows = Array.from(byRow.values())
+        .sort((a, b) => {
+            const sa = a.__sort == null ? 2147483647 : a.__sort;
+            const sb = b.__sort == null ? 2147483647 : b.__sort;
+            if (sa !== sb) return sa - sb;
+            return String(a[rowDimension]).localeCompare(String(b[rowDimension]));
+        })
+        .map((r) => {
+            const copy = { ...r };
+            delete copy.__sort;
+            return copy;
+        });
+
+    return { rows, columns: [rowDimension, ...columns] };
+};
 
 // ---------------------------------------------------------------------------
 // HRIS reporting
@@ -422,24 +533,34 @@ router.get("/status", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const pool = await getReportPool();
 
-        const presence = await pool.request().query(`
-            SELECT
-                  CoreInstalled     = CASE WHEN OBJECT_ID('dbo.usp_EmployeeReport_Detail','P') IS NULL THEN 0 ELSE 1 END
-                , ReportsInstalled  = CASE WHEN OBJECT_ID('dbo.usp_Report_Turnover','P')       IS NULL THEN 0 ELSE 1 END
-                , SnapshotTable     = CASE WHEN OBJECT_ID('dbo.EmployeeReportSnapshot','U')    IS NULL THEN 0 ELSE 1 END
-                , MovementTable     = CASE WHEN OBJECT_ID('dbo.EmployeeMovementSnapshot','U')  IS NULL THEN 0 ELSE 1 END
-        `);
-        const p = (presence.recordset && presence.recordset[0]) || {};
+        const p = await packStatus(pool, true);
 
         const status = {
-            core_installed: !!p.CoreInstalled,
-            reports_installed: !!p.ReportsInstalled,
-            snapshot_table: !!p.SnapshotTable,
-            movement_table: !!p.MovementTable,
+            // Live mode needs nothing installed, so the module is usable the
+            // moment it can reach HRIS.
+            engine_default: DEFAULT_ENGINE,
+            live_available: true,
+            core_installed: p.core,
+            reports_installed: p.reports,
+            snapshot_table: p.snapshot,
+            movement_table: p.movement,
+            live_employee_rows: null,
             employee_rows: null,
             snapshot_taken_at: null,
             movement_rows: null,
         };
+
+        // Doubles as the connectivity probe: if this returns, live mode works.
+        try {
+            const live = await pool
+                .request()
+                .query("SELECT Rows = COUNT(*) FROM dbo.EmployeeDetail");
+            const row = (live.recordset && live.recordset[0]) || {};
+            status.live_employee_rows = row.Rows == null ? null : Number(row.Rows);
+        } catch (e) {
+            status.live_available = false;
+            console.error("[hris-report] live probe failed:", e.message);
+        }
 
         // Counted separately and defensively: referencing a table that does not
         // exist is a compile-time failure in an ad-hoc batch, so these cannot be
@@ -492,7 +613,10 @@ router.get("/meta", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const pool = await getReportPool();
 
-        const options = await pool.request().execute("dbo.usp_ReportFilterOptions");
+        // Plain SELECTs over the lu* tables — the same batch the pack's
+        // usp_ReportFilterOptions runs, sent inline so /meta works with nothing
+        // installed.
+        const options = await pool.request().query(FILTER_OPTIONS_SQL);
         const shaped = shapeSets(options.recordsets, FILTER_OPTION_SETS);
 
         // The employee picker is every active employee — several thousand rows.
@@ -501,15 +625,16 @@ router.get("/meta", auth, roleCheck(["admin"]), async (req, res) => {
             shaped.employees = [];
         }
 
-        const dims = await pool.request().execute("dbo.usp_ReportDimensions");
-
+        // Dimension names come from the live catalogue. Counting members of all
+        // 27 would mean 27 passes over the master CTE, and the UI only needs the
+        // names — /dimensions gives counts for the one being used.
         return res.json({
             error: false,
             options: shaped,
-            dimensions: (dims.recordset || []).map((d) => ({
-                dimension: d.Dimension,
-                distinct_values: d.DistinctValues,
-                employees: d.Employees,
+            dimensions: DIMENSION_NAMES.map((d) => ({
+                dimension: d,
+                distinct_values: null,
+                employees: null,
             })),
         });
     } catch (error) {
@@ -521,10 +646,14 @@ router.get("/meta", auth, roleCheck(["admin"]), async (req, res) => {
 router.get("/dimensions", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const pool = await getReportPool();
-        const request = pool.request();
         const dimension = asText(req.query.dimension || "");
-        if (dimension) request.input("Dimension", sql.VarChar(30), dimension);
-        const result = await request.execute("dbo.usp_ReportDimensions");
+        if (!dimension) {
+            return res.json({
+                error: false,
+                data: DIMENSION_NAMES.map((d) => ({ Dimension: d })),
+            });
+        }
+        const result = await runLive(pool, buildDimensionValues(dimension));
         return res.json({ error: false, data: result.recordset || [] });
     } catch (error) {
         return fail(res, error, "/dimensions");
@@ -539,14 +668,21 @@ router.get("/dimensions", auth, roleCheck(["admin"]), async (req, res) => {
 
 router.post("/detail", auth, roleCheck(["admin"]), async (req, res) => {
     try {
-        const result = await execProc(
-            "dbo.usp_EmployeeReport_Detail",
-            { ...FILTERS, ...DETAIL_EXTRA },
-            req.body
-        );
+        const pool = await getReportPool();
+        const engine = await chooseEngine(pool, req.body);
+
+        const result =
+            engine === "live"
+                ? await runLive(pool, buildDetail(req.body || {}))
+                : await execProc(
+                      "dbo.usp_EmployeeReport_Detail",
+                      { ...FILTERS, ...DETAIL_EXTRA },
+                      req.body
+                  );
         const rows = result.recordset || [];
         return res.json({
             error: false,
+            engine,
             data: rows,
             // TotalRows rides on every row for the server-side pager; lifted out
             // here so the client does not have to reach into row 0.
@@ -562,13 +698,31 @@ router.post("/detail", auth, roleCheck(["admin"]), async (req, res) => {
 
 router.post("/summary", auth, roleCheck(["admin"]), async (req, res) => {
     try {
+        const pool = await getReportPool();
+        const engine = await chooseEngine(pool, req.body);
+
+        if (engine === "live") {
+            // Two statements rather than one: the grand total is over the same
+            // filter but a different grain, and running them separately keeps
+            // both plans simple. Sequential, not Promise.all — they share one
+            // small pool.
+            const groups = await runLive(pool, buildSummary(req.body || {}));
+            const total = await runLive(pool, buildSummaryTotal(req.body || {}));
+            return res.json({
+                error: false,
+                engine,
+                groups: groups.recordset || [],
+                total: total.recordset || [],
+            });
+        }
+
         const result = await execProc(
             "dbo.usp_EmployeeReport_Summary",
             { ...FILTERS, ...SUMMARY_EXTRA },
             req.body
         );
         const sets = shapeSets(result.recordsets, ["groups", "total"]);
-        return res.json({ error: false, ...sets });
+        return res.json({ error: false, engine, ...sets });
     } catch (error) {
         return fail(res, error, "/summary");
     }
@@ -576,6 +730,31 @@ router.post("/summary", auth, roleCheck(["admin"]), async (req, res) => {
 
 router.post("/pivot", auth, roleCheck(["admin"]), async (req, res) => {
     try {
+        const pool = await getReportPool();
+        const engine = await chooseEngine(pool, req.body);
+
+        if (engine === "live") {
+            const cells = await runLive(pool, buildPivotCells(req.body || {}));
+            const rows = cells.recordset || [];
+            if (!rows.length) {
+                return res.json({
+                    error: false,
+                    engine,
+                    data: [],
+                    columns: [],
+                    message: "No employees match the filter.",
+                });
+            }
+            const grid = assemblePivot(rows, req.body.RowDimension);
+            return res.json({
+                error: false,
+                engine,
+                data: grid.rows,
+                columns: grid.columns,
+                message: null,
+            });
+        }
+
         const result = await execProc(
             "dbo.usp_EmployeeReport_Pivot",
             { ...FILTERS, ...PIVOT_EXTRA },
@@ -587,6 +766,7 @@ router.post("/pivot", auth, roleCheck(["admin"]), async (req, res) => {
         const noData = rows.length === 1 && Object.keys(rows[0]).length === 1 && "NoData" in rows[0];
         return res.json({
             error: false,
+            engine,
             data: noData ? [] : rows,
             columns: noData || !rows.length ? [] : Object.keys(rows[0]),
             message: noData ? rows[0].NoData : null,
@@ -598,12 +778,15 @@ router.post("/pivot", auth, roleCheck(["admin"]), async (req, res) => {
 
 router.post("/movement", auth, roleCheck(["admin"]), async (req, res) => {
     try {
-        const result = await execProc(
-            "dbo.usp_HeadcountMovement",
-            MOVEMENT_PARAMS,
-            req.body
-        );
-        return res.json({ error: false, data: result.recordset || [] });
+        const pool = await getReportPool();
+        const engine = await chooseEngine(pool, req.body);
+
+        const result =
+            engine === "live"
+                ? await runLive(pool, buildMovement(req.body || {}))
+                : await execProc("dbo.usp_HeadcountMovement", MOVEMENT_PARAMS, req.body);
+
+        return res.json({ error: false, engine, data: result.recordset || [] });
     } catch (error) {
         return fail(res, error, "/movement");
     }
