@@ -11,7 +11,7 @@ import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
 import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
 import { parseSalaryWorkbook } from "../../utils/rms/salaryIncrementParser.js";
-import { getEmployeeIdentity } from "../../utils/rms/test.js";
+import { getEmployeeIdentity, getEmployeeAddress } from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -451,7 +451,20 @@ router.post("/decision", auth, roleCheck(["user", "admin"]), async (req, res) =>
         const clientIp = (xff ? String(xff).split(",")[0].trim() : null) || req.ip || null;
         const ua = String(req.headers["user-agent"] || "").slice(0, 500);
 
-        const historyEntry = { decision, at: now, user_agent: ua, ip: clientIp };
+        // Which agreement revision was on screen, and whether the employee
+        // ticked the read-confirmation. Both are recorded rather than assumed:
+        // the agreement's Acknowledgment clause turns on the employee having
+        // read it, and the wording is revised between years.
+        const agreementVersion = String(req.body.agreement_version || "").trim().slice(0, 20);
+        const readConfirmed = req.body.agreement_read_confirmed === true;
+
+        const historyEntry = {
+            decision,
+            at: now,
+            user_agent: ua,
+            ip: clientIp,
+            agreement_version: agreementVersion,
+        };
 
         const existing = await SalaryCommitmentDecision.findOne({
             fiscal_year,
@@ -463,6 +476,8 @@ router.post("/decision", auth, roleCheck(["user", "admin"]), async (req, res) =>
             existing.decided_at = now;
             existing.user_agent = ua;
             existing.ip = clientIp;
+            existing.agreement_version = agreementVersion;
+            existing.agreement_read_confirmed = readConfirmed;
             existing.decision_history.push(historyEntry);
             saved = await existing.save();
         } else {
@@ -473,6 +488,8 @@ router.post("/decision", auth, roleCheck(["user", "admin"]), async (req, res) =>
                 decided_at: now,
                 user_agent: ua,
                 ip: clientIp,
+                agreement_version: agreementVersion,
+                agreement_read_confirmed: readConfirmed,
                 decision_history: [historyEntry],
             }).save();
         }
@@ -596,6 +613,19 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
             getEmployeeIdentity(user.user).catch(() => null),
         ]);
 
+        // Address is fetched SEPARATELY, after the identity lookup above, not
+        // added to that Promise.all. Every helper in utils/rms/test.js opens
+        // the global mssql pool and closes it in a finally, so two of them
+        // running concurrently kill each other — the same trap that forced the
+        // serialization fix in routes/rms/auth.js.
+        //
+        // Non-fatal like the identity lookup: the legal team wants the
+        // employee's address on the agreement, but a missing HRIS address must
+        // not stop someone recording their commitment decision.
+        const hrAddress = await getEmployeeAddress(user.user, user.employee_id).catch(
+            () => null
+        );
+
         let decision = null;
         if (period) {
             decision = await SalaryCommitmentDecision.findOne({
@@ -675,6 +705,48 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 source: "hris",
             };
         }
+
+        // The agreement names both parties by address, so the employee's is
+        // composed here rather than in each client — web modal, PDF and any
+        // future mobile view then print the identical string.
+        //
+        // Mirrors the Bank's own address format: "<City> City, <SubCity>
+        // Sub-City, Woreda <n>, Kebele <n>, House No. <n>, Telephone No. <n>,
+        // P.O. Box <n>". Empty parts are dropped rather than printed blank, so
+        // a partial HRIS record still reads as a sentence.
+        const addressParts = [];
+        if (hrAddress) {
+            const push = (value, format) => {
+                const v = String(value == null ? "" : value).trim();
+                if (v && v !== "***") addressParts.push(format(v));
+            };
+            push(hrAddress.City, (v) => `${v} City`);
+            push(hrAddress.SubCity, (v) => `${v} Sub-City`);
+            push(hrAddress.Zone, (v) => `Zone ${v}`);
+            push(hrAddress.Woreda, (v) => `Woreda ${v}`);
+            push(hrAddress.Kebele, (v) => `Kebele ${v}`);
+            push(hrAddress.HouseNumber, (v) => `House No. ${v}`);
+            push(hrAddress.Telephone, (v) => `Telephone No. ${v}`);
+            push(hrAddress.POBox, (v) => `P.O. Box ${v}`);
+        }
+
+        employeeInfo.address = addressParts.join(", ");
+        employeeInfo.address_parts = hrAddress
+            ? {
+                  region: hrAddress.Region || "",
+                  city: hrAddress.City || "",
+                  sub_city: hrAddress.SubCity || "",
+                  zone: hrAddress.Zone || "",
+                  woreda: hrAddress.Woreda || "",
+                  kebele: hrAddress.Kebele || "",
+                  house_number: hrAddress.HouseNumber || "",
+                  telephone: hrAddress.Telephone || "",
+                  po_box: hrAddress.POBox || "",
+              }
+            : null;
+        // Lets the client show "address missing from HRIS — contact HR" rather
+        // than silently printing a blank line into a signed agreement.
+        employeeInfo.address_source = employeeInfo.address ? "hris" : "missing";
 
         return res.json({
             error: false,
