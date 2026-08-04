@@ -27,6 +27,12 @@ const decisionHistoryEntrySchema = new Schema(
         },
         user_agent: { type: String, trim: true },
         ip: { type: String, trim: true },
+        // Which revision of the agreement text was on screen when this
+        // decision was made. The legal team revises the wording between
+        // years, so "they accepted" is only meaningful alongside "accepted
+        // what" — see the Agreement Version line the document itself asks to
+        // be auto-tagged into the acceptance record.
+        agreement_version: { type: String, trim: true },
     },
     { _id: false }
 );
@@ -62,6 +68,12 @@ const salaryCommitmentDecisionSchema = new Schema({
     // audit on the latest flip
     user_agent: { type: String, trim: true },
     ip: { type: String, trim: true },
+    agreement_version: { type: String, trim: true },
+    // The employee ticked "I have read and understood" before the decision
+    // was accepted. Stored because the agreement's own Acknowledgment clause
+    // turns on the employee having read it, so it is worth being able to
+    // evidence that the confirmation was given rather than inferred.
+    agreement_read_confirmed: { type: Boolean, default: false },
 });
 
 salaryCommitmentDecisionSchema.index(
