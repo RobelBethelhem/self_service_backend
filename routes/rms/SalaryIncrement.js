@@ -514,6 +514,39 @@ router.post("/decision", auth, roleCheck(["user", "admin"]), async (req, res) =>
 });
 
 // ============================================================
+// Timestamps in the export are rendered in East Africa Time for HR, e.g.
+// "Aug 3, 2025 at 10:00 AM". Everything is stored in UTC; only this export
+// converts.
+//
+// Ethiopia is UTC+3 all year with no daylight saving, so shifting by a fixed
+// offset and reading the UTC parts is exact rather than an approximation — and
+// it avoids depending on the server's ICU build having timezone data, which a
+// small-icu Node would not.
+const EAT_OFFSET_MS = 3 * 60 * 60 * 1000;
+const MONTHS_SHORT = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+const formatEat = (value) => {
+    if (!value) return "";
+    const utc = new Date(value);
+    if (Number.isNaN(utc.getTime())) return "";
+
+    const eat = new Date(utc.getTime() + EAT_OFFSET_MS);
+    const month = MONTHS_SHORT[eat.getUTCMonth()];
+    const day = eat.getUTCDate();
+    const year = eat.getUTCFullYear();
+    const minutes = String(eat.getUTCMinutes()).padStart(2, "0");
+
+    const rawHour = eat.getUTCHours();
+    const suffix = rawHour >= 12 ? "PM" : "AM";
+    // 0 -> 12 AM, 12 -> 12 PM; every other hour is the remainder.
+    const hour = rawHour % 12 === 0 ? 12 : rawHour % 12;
+
+    return `${month} ${day}, ${year} at ${hour}:${minutes} ${suffix}`;
+};
+
 // GET /decisions/export?fiscal_year=YYYY — admin-only xlsx download.
 // Used after the period closes so HR can prepare the import workbook.
 // Columns: Domain Name, Employee Name, Decision, Decided At, Flips.
@@ -601,7 +634,7 @@ router.get("/decisions/export", auth, roleCheck(["admin"]), async (req, res) => 
                 (matched && hris.employee_id) || fallback.employee_id || "",
                 (matched && hris.name) || fallback.name || "",
                 d.decision,
-                d.decided_at ? new Date(d.decided_at).toISOString() : "",
+                formatEat(d.decided_at),
                 Array.isArray(d.decision_history) ? d.decision_history.length : 0,
                 d.agreement_version || "",
                 matched ? "HRIS" : "Portal record (not matched in HRIS)",
