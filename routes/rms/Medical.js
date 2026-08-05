@@ -130,7 +130,7 @@ router.post("/register_request_medical", auth, roleCheck(["user", "admin"]), asy
     // Best-effort: if HRIS is unreachable, fall back to splitting
     // domain_user (the legacy behavior) so we don't block submission.
     try {
-      const hrIdentity = await getEmployeeIdentity(user.user);
+      const hrIdentity = await getEmployeeIdentity(user.user, user.employee_id);
       if (hrIdentity) {
         req.body.employee_first_name = hrIdentity.Name || '';
         req.body.employee_middle_name = hrIdentity.FName || '';
@@ -261,7 +261,7 @@ router.patch("/view_request_medical", auth, roleCheck(["admin"]), async (req, re
       employee_last_name: originalRequest.employee_last_name,
     };
     try {
-      const hrIdentity = await getEmployeeIdentity(originalRequest.domain_user);
+      const hrIdentity = await getEmployeeIdentity(originalRequest.domain_user, originalRequest.employee_id_no);
       if (hrIdentity) {
         approvalNames = {
           employee_first_name: hrIdentity.Name || approvalNames.employee_first_name || '',

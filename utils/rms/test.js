@@ -316,9 +316,32 @@ ORDER BY
 // caller can fall back to the Mongo user.position. We deliberately do NOT
 // inner-join EmployeeExperience on the outer query — employees with no
 // experience row should still resolve identity (name + EmployeeId).
-const getEmployeeIdentity = async (username) => {
+const getEmployeeIdentity = async (username, employeeId) => {
     try {
         await sql.connect(dbConfig);
+
+        // Resolve the HRIS UserId the robust way — EmployeeId first, then
+        // UserName JOINed with EmployeeDetail — rather than matching
+        // UserProfile.UserName directly.
+        //
+        // This used to be a bare `WHERE d.UserName = @username`, which misses
+        // whenever the AD name in Mongo does not match the HRIS UserProfile
+        // row, or when a rename left two UserProfile rows and the orphan was
+        // picked. The caller then fell back to the Mongo User document, which
+        // holds only a two-part name and its own employee id — wrong values to
+        // print on a legal agreement.
+        //
+        // employeeId is optional: passing undefined simply skips the
+        // EmployeeId path, so existing single-argument callers keep working
+        // and still get the better UserName resolution.
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) {
+            console.warn(
+                `[getEmployeeIdentity] no HRIS UserId for username='${username}' employeeId='${employeeId || "(none)"}'`
+            );
+            return null;
+        }
+
         const request = new sql.Request();
 
         // OUTER APPLY pulls the latest internal experience's position +
@@ -346,7 +369,6 @@ const getEmployeeIdentity = async (username) => {
                 le.GradeName       AS CurrentJobGrade,
                 le.DeptName        AS CurrentDepartment
             FROM EmployeeDetail a
-            JOIN UserProfile d ON d.UserId = a.UserId
             OUTER APPLY (
                 SELECT TOP 1
                     p.[Postion],
@@ -362,14 +384,75 @@ const getEmployeeIdentity = async (username) => {
                     CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END,
                     e.[From] DESC
             ) le
-            WHERE d.UserName = @username
+            WHERE a.UserId = @userId
         `;
-        request.input('username', sql.NVarChar, username);
+        request.input('userId', sql.Int, userId);
         const result = await request.query(query);
         return result.recordset[0] || null;
     } catch (e) {
         console.error("Error fetching employee identity:", e.message);
         return null;
+    } finally {
+        await sql.close();
+    }
+};
+
+// HRIS lookup for MANY employees at once, keyed by AD username.
+//
+// Used by the salary-decision export, which needs a canonical name and
+// employee id per row. Doing that with one getEmployeeIdentity call per
+// employee would be hundreds of round trips — and worse, each of those opens
+// and closes the global mssql pool, so any overlap kills the connection the
+// others are using.
+//
+// Returns the full three-part Ethiopian name (given / father / grandfather).
+// The Mongo User document only carries two, which is why an export built from
+// it stops at the father's name.
+//
+// Usernames are sent as parameters in chunks: SQL Server caps a batch at 2100
+// parameters, so a bank-sized list would fail as one IN clause.
+const getEmployeeDirectory = async (usernames) => {
+    const wanted = Array.from(
+        new Set(
+            (Array.isArray(usernames) ? usernames : [])
+                .map((u) => String(u == null ? "" : u).trim())
+                .filter((u) => u !== "")
+        )
+    );
+    if (!wanted.length) return [];
+
+    try {
+        await sql.connect(dbConfig);
+
+        const CHUNK = 500;
+        const rows = [];
+        for (let i = 0; i < wanted.length; i += CHUNK) {
+            const slice = wanted.slice(i, i + CHUNK);
+            const request = new sql.Request();
+            const placeholders = slice.map((value, n) => {
+                request.input(`u${n}`, sql.NVarChar(250), value);
+                return `@u${n}`;
+            });
+
+            // JOINed with EmployeeDetail so orphan UserProfile rows — the
+            // duplicates left behind by renames — cannot win the match.
+            // eslint-disable-next-line no-await-in-loop
+            const result = await request.query(`
+                SELECT u.UserName, d.EmployeeId, d.[Name], d.FName, d.GFName
+                FROM dbo.EmployeeDetail d
+                JOIN dbo.UserProfile u ON u.UserId = d.UserId
+                WHERE u.UserName IN (${placeholders.join(", ")})
+            `);
+            rows.push(...(result.recordset || []));
+        }
+
+        console.log(
+            `[getEmployeeDirectory] asked for ${wanted.length} username(s), matched ${rows.length}`
+        );
+        return rows;
+    } catch (e) {
+        console.error("[getEmployeeDirectory] Error:", e.message);
+        return [];
     } finally {
         await sql.close();
     }
@@ -890,4 +973,4 @@ const getRatingProfile = async (username, employeeId) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, getRatingProfile, _sanitizeHris };
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeDirectory, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, getRatingProfile, _sanitizeHris };

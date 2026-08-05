@@ -78,7 +78,7 @@ router.get("/me", auth, async (req, res) => {
         // slower one's request throws, gets swallowed by its try/catch,
         // and returns null — silently. Running sequentially keeps each
         // helper's pool lifecycle isolated.
-        const hr = await getEmployeeIdentity(user.user).catch(() => null);
+        const hr = await getEmployeeIdentity(user.user, user.employee_id).catch(() => null);
         const addr = await getEmployeeAddress(user.user, user.employee_id).catch(() => null);
         const profile = {
             first_name: (hr && hr.Name) || user.first_name || "",

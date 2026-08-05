@@ -11,7 +11,11 @@ import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
 import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
 import PushNotificationService from "../../utils/rms/pushNotificationService.js";
 import { parseSalaryWorkbook } from "../../utils/rms/salaryIncrementParser.js";
-import { getEmployeeIdentity, getEmployeeAddress } from "../../utils/rms/test.js";
+import {
+    getEmployeeIdentity,
+    getEmployeeAddress,
+    getEmployeeDirectory,
+} from "../../utils/rms/test.js";
 
 const router = Router();
 
@@ -533,36 +537,74 @@ router.get("/decisions/export", auth, roleCheck(["admin"]), async (req, res) => 
         );
 
         const usernames = decisions.map((d) => d.domain_user);
+
+        // HRIS is the source for both the name and the employee id.
+        //
+        // The Mongo User document only holds first_name and last_name, which
+        // in Ethiopian naming reaches the FATHER's name and stops — the
+        // grandfather's name is simply not there. HRIS carries all three
+        // (Name / FName / GFName), so the export reads from it and keeps Mongo
+        // only as a fallback for anyone HRIS cannot match.
+        //
+        // One batched query rather than a lookup per row: each helper in
+        // test.js opens and closes the global mssql pool, so hundreds of
+        // sequential calls would be slow and any overlap would break them.
+        const directory = usernames.length ? await getEmployeeDirectory(usernames) : [];
+        const hrisByLowerUser = new Map();
+        for (const row of directory) {
+            hrisByLowerUser.set(String(row.UserName || "").toLowerCase(), {
+                name: [row.Name, row.FName, row.GFName]
+                    .map((p) => String(p == null ? "" : p).trim())
+                    .filter(Boolean)
+                    .join(" "),
+                employee_id: row.EmployeeId ? String(row.EmployeeId).trim() : "",
+            });
+        }
+
         const users = usernames.length ? await User.find({ user: { $in: usernames } }).lean() : [];
-        const nameByLowerUser = new Map();
+        const fallbackByLowerUser = new Map();
         for (const u of users) {
-            nameByLowerUser.set(
-                String(u.user).toLowerCase(),
-                `${u.first_name || ""} ${u.last_name || ""}`.trim()
-            );
+            fallbackByLowerUser.set(String(u.user).toLowerCase(), {
+                name: `${u.first_name || ""} ${u.last_name || ""}`.trim(),
+                employee_id: u.employee_id ? String(u.employee_id).trim() : "",
+            });
         }
 
         // Two-sheet workbook: "Approved" first, "Rejected" second. Each sheet
         // gets the same column shape so HR can copy rows between them or out
         // into the salary-increment import workbook.
+        //
+        // "Source" tells HR which rows came from HRIS and which fell back to
+        // the portal's own record — the fallback rows are the ones whose name
+        // stops at the father and whose employee id may not match HRIS.
         const headers = [
             "Domain Name",
+            "Employee ID",
             "Employee Name",
             "Decision",
             "Decided At",
             "Flips",
+            "Agreement Version",
+            "Source",
         ];
         const approvedAoa = [headers];
         const rejectedAoa = [headers];
 
         for (const d of decisions) {
-            const name = nameByLowerUser.get(String(d.domain_user).toLowerCase()) || "";
+            const key = String(d.domain_user).toLowerCase();
+            const hris = hrisByLowerUser.get(key);
+            const fallback = fallbackByLowerUser.get(key) || { name: "", employee_id: "" };
+            const matched = !!(hris && (hris.name || hris.employee_id));
+
             const row = [
                 d.domain_user,
-                name,
+                (matched && hris.employee_id) || fallback.employee_id || "",
+                (matched && hris.name) || fallback.name || "",
                 d.decision,
                 d.decided_at ? new Date(d.decided_at).toISOString() : "",
                 Array.isArray(d.decision_history) ? d.decision_history.length : 0,
+                d.agreement_version || "",
+                matched ? "HRIS" : "Portal record (not matched in HRIS)",
             ];
             if (d.decision === "Approved") approvedAoa.push(row);
             else if (d.decision === "Rejected") rejectedAoa.push(row);
@@ -610,7 +652,9 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 .populate("import_batch_id")
                 .sort({ fiscal_year: -1, TimeStamp: -1 }),
             SalaryCommitmentPeriod.findOne({}).sort({ fiscal_year: -1 }).lean(),
-            getEmployeeIdentity(user.user).catch(() => null),
+            // employee_id is passed so HRIS can be resolved by that stable,
+            // business-unique key first and only fall back to the AD username.
+            getEmployeeIdentity(user.user, user.employee_id).catch(() => null),
         ]);
 
         // Address is fetched SEPARATELY, after the identity lookup above, not
@@ -697,14 +741,24 @@ router.get("/my", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 first_name: hrIdentity.Name || employeeInfo.first_name,
                 middle_name: hrIdentity.FName || employeeInfo.middle_name,
                 last_name: hrIdentity.GFName || employeeInfo.last_name,
-                employee_id: hrIdentity.EmployeeId
-                    ? String(hrIdentity.EmployeeId)
-                    : employeeInfo.employee_id,
+                // NOT falling back to the Mongo employee_id. This is the id
+                // printed on a legal agreement, and the Mongo User document
+                // has been observed to disagree with HRIS. A blank the client
+                // can flag is safer than a plausible wrong number.
+                employee_id: hrIdentity.EmployeeId ? String(hrIdentity.EmployeeId) : "",
                 position: hrIdentity.CurrentPosition || employeeInfo.position,
                 domain_user: user.user,
                 source: "hris",
             };
+        } else {
+            // HRIS did not resolve. The Mongo name is two parts only (given +
+            // father), so it cannot render the three-part name the agreement
+            // needs — the client shows a warning rather than presenting it as
+            // authoritative.
+            employeeInfo.employee_id = "";
         }
+
+        employeeInfo.employee_id_source = employeeInfo.employee_id ? "hris" : "missing";
 
         // The agreement names both parties by address, so the employee's is
         // composed here rather than in each client — web modal, PDF and any
