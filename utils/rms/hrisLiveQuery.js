@@ -616,6 +616,15 @@ export const buildDetail = (body) => {
     // this bank has roughly six thousand records. A 2000 cap silently returned
     // a third of them with nothing on screen to say so; TotalRows rides on
     // every row so the client can report any cap that does bite.
+    // The tiebreaker is m.UserId, not m.FullName.
+    //
+    // SQL Server rejects a duplicated column in ORDER BY, and FullName is the
+    // DEFAULT sort — so "sort by name" emitted "ORDER BY m.FullName ASC,
+    // m.FullName" and failed outright. UserId can never collide because it is
+    // not one of the sortable columns, and being the primary key it is also a
+    // better tiebreaker: FullName is not unique, so ties in it made OFFSET /
+    // FETCH paging non-deterministic and could repeat or skip a row between
+    // pages.
     const size = Math.min(10000, Math.max(1, parseInt(body.PageSize, 10) || 100));
     const page = Math.max(1, parseInt(body.PageNumber, 10) || 1);
     const offset = add(sql.Int, (page - 1) * size);
@@ -627,7 +636,7 @@ SELECT ${DETAIL_COLUMNS}
      , SnapshotTakenAt = SYSDATETIME()
 FROM Master m
 ${where}
-ORDER BY ${sortColumn} ${dir}, m.FullName
+ORDER BY ${sortColumn} ${dir}, m.UserId
 OFFSET ${offset} ROWS FETCH NEXT ${fetch} ROWS ONLY
 OPTION (RECOMPILE)`;
 
@@ -1301,12 +1310,19 @@ const buildManpower = (body) => {
         inList(add, "m.BankingCenterId", body.BankingCenters),
     ]);
 
+    // Rolling up TO department means the level column IS the department column.
+    // Emitting it twice would repeat the heading and, more importantly, put the
+    // same column in ORDER BY twice — which SQL Server rejects outright.
+    const levelIsDepartment = level.label === DIMENSIONS.Department.label;
+    const groupCols = levelIsDepartment
+        ? ["m.President", "m.Department"]
+        : ["m.President", "m.Department", level.label];
+
     const structure = {
         set: "structure",
         text: `${MASTER_CTE}
 SELECT President = m.President
-     , Department = m.Department
-     , [${levelName}] = ${level.label}
+     , Department = m.Department${levelIsDepartment ? "" : `\n     , [${levelName}] = ${level.label}`}
      , Headcount = COUNT(*)
      , Male = SUM(CASE WHEN m.Gender = 'Male' THEN 1 ELSE 0 END)
      , Female = SUM(CASE WHEN m.Gender = 'Female' THEN 1 ELSE 0 END)
@@ -1315,8 +1331,8 @@ SELECT President = m.President
      , [Avg salary] = CAST(AVG(m.Salary) AS decimal(18,2))
 FROM Master m
 ${where}
-GROUP BY m.President, m.Department, ${level.label}
-ORDER BY m.President, m.Department, ${level.label}
+GROUP BY ${groupCols.join(", ")}
+ORDER BY ${groupCols.join(", ")}
 OPTION (RECOMPILE)`,
         params,
     };
