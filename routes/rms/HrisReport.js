@@ -831,7 +831,16 @@ router.post("/standard/:report", auth, roleCheck(["admin"]), async (req, res) =>
             // Each report is a short list of queries, run in ORDER and one at a
             // time. Never Promise.all — they share one small pool, and the
             // order is what names the result sets.
-            const queries = builder(req.body || {});
+            let queries = builder(req.body || {});
+
+            // The reports that offer "Include summary" must honour it. The
+            // builders always produce both sets; dropping it here keeps that
+            // choice in one place rather than threading a flag through eleven
+            // builders. Only an explicit false suppresses it.
+            if ((req.body || {}).IncludeSummary === false) {
+                queries = queries.filter((q) => q.set !== "summary");
+            }
+
             const sets = {};
             for (let i = 0; i < queries.length; i += 1) {
                 const q = queries[i];

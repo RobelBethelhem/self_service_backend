@@ -612,7 +612,11 @@ export const buildDetail = (body) => {
     const sortColumn = SORTABLE[body.SortBy] || SORTABLE.FullName;
     const dir = String(body.SortDir || "ASC").toUpperCase() === "DESC" ? "DESC" : "ASC";
 
-    const size = Math.min(2000, Math.max(1, parseInt(body.PageSize, 10) || 100));
+    // The General Purpose list asks for the whole workforce in one page, and
+    // this bank has roughly six thousand records. A 2000 cap silently returned
+    // a third of them with nothing on screen to say so; TotalRows rides on
+    // every row so the client can report any cap that does bite.
+    const size = Math.min(10000, Math.max(1, parseInt(body.PageSize, 10) || 100));
     const page = Math.max(1, parseInt(body.PageNumber, 10) || 1);
     const offset = add(sql.Int, (page - 1) * size);
     const fetch = add(sql.Int, size);
@@ -1268,7 +1272,7 @@ OPTION (RECOMPILE)`,
 const buildGeneralPurpose = (body) => {
     // Same shape as the Explorer's employee list; the filter vocabulary is a
     // subset of the 55, so buildDetail already understands every field.
-    const built = buildDetail({ ...body, PageSize: 5000, PageNumber: 1 });
+    const built = buildDetail({ ...body, PageSize: 10000, PageNumber: 1 });
     return [{ set: "detail", text: built.text, params: built.params }];
 };
 
