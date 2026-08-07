@@ -12,6 +12,7 @@ import {
     buildPivotCells,
     buildMovement,
     buildDimensionValues,
+    STANDARD_REPORT_BUILDERS,
 } from "../../utils/rms/hrisLiveQuery.js";
 
 const router = Router();
@@ -810,13 +811,41 @@ router.get("/standard", auth, roleCheck(["admin"]), (req, res) => {
 
 router.post("/standard/:report", auth, roleCheck(["admin"]), async (req, res) => {
     try {
-        const def = STANDARD_REPORTS[String(req.params.report || "").toLowerCase()];
+        const key = String(req.params.report || "").toLowerCase();
+        const def = STANDARD_REPORTS[key];
         if (!def) {
             return res.status(404).json({ error: true, message: "Unknown report" });
         }
+
+        const pool = await getReportPool();
+        const engine = await chooseEngine(pool, req.body);
+
+        if (engine === "live") {
+            const builder = STANDARD_REPORT_BUILDERS[key];
+            if (!builder) {
+                return res.status(400).json({
+                    error: true,
+                    message: `"${def.label}" is not available in live mode.`,
+                });
+            }
+            // Each report is a short list of queries, run in ORDER and one at a
+            // time. Never Promise.all — they share one small pool, and the
+            // order is what names the result sets.
+            const queries = builder(req.body || {});
+            const sets = {};
+            for (let i = 0; i < queries.length; i += 1) {
+                const q = queries[i];
+                // eslint-disable-next-line no-await-in-loop
+                const r = await runLive(pool, q);
+                sets[q.set] = r.recordset || [];
+            }
+            return res.json({ error: false, engine, report: def.label, sets });
+        }
+
         const result = await execProc(def.proc, def.params, req.body);
         return res.json({
             error: false,
+            engine,
             report: def.label,
             sets: shapeSets(result.recordsets, def.sets),
         });

@@ -887,6 +887,111 @@ OPTION (MAXRECURSION 1200, RECOMPILE)`;
     return { text, params };
 };
 
+// ---------------------------------------------------------------------------
+// Movement derivation
+// ---------------------------------------------------------------------------
+// The pack materialises this into EmployeeMovementSnapshot. It is a self-join
+// of consecutive internal postings, so it inlines cleanly — no table, no
+// refresh job.
+//
+// Every rule is the SQL author's, carried over with the reasoning:
+//   * Department on the posting row is null on 61 internal rows, so it falls
+//     back to the position's own place in the org chart.
+//   * "A/", "Acting", "Relief" and the misspelling "Relif" all appear among
+//     the acting-style position titles.
+//   * Acting transitions are tested BEFORE grade, so confirming someone out of
+//     an acting post is not reported as a demotion.
+//
+// Emitted without a leading WITH so it can be appended to MASTER_CTE or opened
+// with one of its own.
+export const MOVEMENT_BODY = `
+Postings AS (
+    SELECT e.UserId, e.Id, e.[From], e.DateOfRelease,
+           PositionId = e.Position,
+           Position   = p.Postion,
+           GradeName  = g.Name,
+           GradeSort  = CASE p.Grade
+                WHEN 1 THEN 10 WHEN 2 THEN 20 WHEN 3 THEN 30 WHEN 4 THEN 40 WHEN 5 THEN 50
+                WHEN 1023 THEN 51 WHEN 7 THEN 52 WHEN 1020 THEN 53 WHEN 8 THEN 60
+                WHEN 9 THEN 70 WHEN 10 THEN 80 WHEN 1024 THEN 90 WHEN 12 THEN 100
+                WHEN 13 THEN 110 WHEN 14 THEN 120 WHEN 15 THEN 130 WHEN 16 THEN 140
+                WHEN 17 THEN 150 WHEN 18 THEN 160 END,
+           DepartmentId = COALESCE(e.Department, p.Department, dv.Department),
+           BankingCenterId = e.BankingCenter,
+           IsActing = CASE WHEN p.Postion LIKE 'A/%' OR p.Postion LIKE '%Acting%'
+                             OR p.Postion LIKE '%Relief%' OR p.Postion LIKE '%Relif%'
+                           THEN 1 ELSE 0 END,
+           rn = ROW_NUMBER() OVER (PARTITION BY e.UserId ORDER BY e.[From], e.Id)
+    FROM dbo.EmployeeExperience e
+    LEFT JOIN dbo.luPosition  p  ON p.Id  = e.Position
+    LEFT JOIN dbo.luJobGrade  g  ON g.Id  = p.Grade
+    LEFT JOIN dbo.luDivision  dv ON dv.Id = COALESCE(e.Division, p.Division)
+    WHERE e.ExperienceType = 1 AND e.[From] IS NOT NULL
+),
+Pairs AS (
+    SELECT c.UserId, SeqNo = c.rn, MoveDate = c.[From],
+           PrevPosition = pr.Position, PrevGrade = pr.GradeName, PrevGradeSort = pr.GradeSort,
+           PrevDepartmentId = pr.DepartmentId, PrevBankingCenterId = pr.BankingCenterId,
+           PrevStart = pr.[From], PrevIsActing = pr.IsActing, PrevPositionId = pr.PositionId,
+           NewPosition = c.Position, NewGrade = c.GradeName, NewGradeSort = c.GradeSort,
+           NewDepartmentId = c.DepartmentId, NewBankingCenterId = c.BankingCenterId,
+           NewIsActing = c.IsActing, NewPositionId = c.PositionId,
+           c.DateOfRelease
+    FROM Postings c
+    JOIN Postings pr ON pr.UserId = c.UserId AND pr.rn = c.rn - 1
+),
+Movement AS (
+    SELECT
+          m.UserId
+        , d.EmployeeId
+        , FullName = d.[Name] + ' ' + d.FName + ' ' + d.GFName
+        , Gender = d.Sex
+        , m.SeqNo, m.MoveDate
+        , MoveYear = YEAR(m.MoveDate)
+        , MoveMonth = MONTH(m.MoveDate)
+        , MoveQuarter = CAST(YEAR(m.MoveDate) AS varchar(4)) + '-Q'
+                      + CAST(DATEPART(QUARTER, m.MoveDate) AS varchar(1))
+        , PrevPosition = ISNULL(m.PrevPosition, '(Unknown)')
+        , PrevGrade    = ISNULL(m.PrevGrade, '(Unknown)')
+        , PrevDepartment = ISNULL(pd.Name, '(Unassigned)')
+        , PrevBankingCenter = ISNULL(pb.Name, '(Head Office / None)')
+        , m.PrevStart
+        , YearsInPrevPosition = CASE
+              WHEN DATEDIFF(DAY, m.PrevStart, m.MoveDate) BETWEEN 0 AND 16436
+              THEN CAST(DATEDIFF(DAY, m.PrevStart, m.MoveDate)/365.25 AS decimal(9,2)) END
+        , NewPosition = ISNULL(m.NewPosition, '(Unknown)')
+        , NewGrade    = ISNULL(m.NewGrade, '(Unknown)')
+        , NewDepartment = ISNULL(nd.Name, '(Unassigned)')
+        , NewBankingCenter = ISNULL(nb.Name, '(Head Office / None)')
+        , m.PrevDepartmentId, m.NewDepartmentId, m.NewBankingCenterId
+        , IsPromotion = CASE WHEN m.NewGradeSort > m.PrevGradeSort THEN 1 ELSE 0 END
+        , IsGradeDecrease = CASE WHEN m.NewGradeSort < m.PrevGradeSort THEN 1 ELSE 0 END
+        , IsTransfer = CASE WHEN ISNULL(m.NewDepartmentId,-1)    <> ISNULL(m.PrevDepartmentId,-1)
+                              OR ISNULL(m.NewBankingCenterId,-1) <> ISNULL(m.PrevBankingCenterId,-1)
+                            THEN 1 ELSE 0 END
+        , IsBranchMove = CASE WHEN ISNULL(m.NewBankingCenterId,-1) <> ISNULL(m.PrevBankingCenterId,-1)
+                              THEN 1 ELSE 0 END
+        , MoveType = CASE
+              WHEN m.PrevIsActing = 1 AND m.NewIsActing = 0 THEN 'Confirmed from acting'
+              WHEN m.PrevIsActing = 0 AND m.NewIsActing = 1 THEN 'Acting appointment'
+              WHEN m.NewGradeSort > m.PrevGradeSort         THEN 'Promotion'
+              WHEN m.NewGradeSort < m.PrevGradeSort         THEN 'Grade decrease'
+              WHEN ISNULL(m.NewDepartmentId,-1) <> ISNULL(m.PrevDepartmentId,-1)
+                OR ISNULL(m.NewBankingCenterId,-1) <> ISNULL(m.PrevBankingCenterId,-1)
+                                                            THEN 'Transfer'
+              WHEN ISNULL(m.NewPositionId,-1) <> ISNULL(m.PrevPositionId,-1)
+                                                            THEN 'Reassignment'
+              ELSE 'No recorded change' END
+        , m.DateOfRelease
+        , CurrentSalary = d.Salary
+    FROM Pairs m
+    JOIN dbo.EmployeeDetail d ON d.UserId = m.UserId
+    LEFT JOIN dbo.luDepartment pd    ON pd.Id = m.PrevDepartmentId
+    LEFT JOIN dbo.luDepartment nd    ON nd.Id = m.NewDepartmentId
+    LEFT JOIN dbo.luBankingCenter pb ON pb.Id = m.PrevBankingCenterId
+    LEFT JOIN dbo.luBankingCenter nb ON nb.Id = m.NewBankingCenterId
+)`;
+
 // --- lookups ---------------------------------------------------------------
 // The pack's usp_ReportFilterOptions in one batch of plain SELECTs.
 
@@ -926,6 +1031,577 @@ ORDER BY ISNULL(MIN(${dim.sort ? dim.sort : "CAST(NULL AS int)"}), 2147483647), 
 OPTION (RECOMPILE)`,
         params: [],
     };
+};
+
+// ---------------------------------------------------------------------------
+// The eleven standard reports, live
+// ---------------------------------------------------------------------------
+// Each returns an ordered list of { set, text, params }. The route runs them in
+// order — sequentially, never Promise.all, because they share one small pool.
+//
+// Several are the Explorer's own shapes with the group-by fixed, so they
+// delegate rather than restate the aggregate. Where a report's columns differ
+// from the Explorer's they are written out to match the pack's output, so HR
+// sees the same headings they already know.
+
+const dateRange = (add, column, from, to) => {
+    const parts = [];
+    if (present(from)) {
+        const d = new Date(from);
+        if (!Number.isNaN(d.getTime())) parts.push(`${column} >= ${add(sql.Date, d)}`);
+    }
+    if (present(to)) {
+        const d = new Date(to);
+        if (!Number.isNaN(d.getTime())) parts.push(`${column} <= ${add(sql.Date, d)}`);
+    }
+    return parts;
+};
+
+const inList = (add, column, raw) => {
+    if (!present(raw)) return null;
+    const ids = idList(raw);
+    if (!ids.length) return null;
+    return `${column} IN (${ids.map((id) => add(sql.Int, id)).join(", ")})`;
+};
+
+const whereOf = (parts) => {
+    const kept = parts.filter(Boolean);
+    return kept.length ? `WHERE ${kept.join("\n  AND ")}` : "";
+};
+
+// --- movement-based: promotion & transfer ----------------------------------
+
+const buildPromotion = (body) => {
+    const { params, add } = makeParams();
+
+    // Default is promotions only; @MoveTypes widens it to any recorded type.
+    let typeClause = "m.MoveType = 'Promotion'";
+    if (present(body.MoveTypes)) {
+        const types = textList(body.MoveTypes);
+        if (types.length) {
+            typeClause = `m.MoveType IN (${types
+                .map((t) => add(sql.NVarChar(60), t))
+                .join(", ")})`;
+        }
+    }
+
+    const where = whereOf([
+        typeClause,
+        ...dateRange(add, "m.MoveDate", body.From, body.To),
+        inList(add, "m.NewDepartmentId", body.Departments),
+        inList(add, "m.NewBankingCenterId", body.BankingCenters),
+        present(body.Gender) && String(body.Gender).toLowerCase() !== "all"
+            ? `m.Gender = ${add(sql.VarChar(10), String(body.Gender).trim())}`
+            : null,
+    ]);
+
+    const detail = {
+        set: "detail",
+        text: `WITH ${MOVEMENT_BODY}
+SELECT [ID No.] = m.EmployeeId
+     , [Full name] = m.FullName
+     , Gender = m.Gender
+     , [Move date] = m.MoveDate
+     , [Move type] = m.MoveType
+     , [Previous position] = m.PrevPosition
+     , [Previous grade] = m.PrevGrade
+     , [Previous department] = m.PrevDepartment
+     , [Years in previous position] = m.YearsInPrevPosition
+     , [Position] = m.NewPosition
+     , [Grade] = m.NewGrade
+     , [Department] = m.NewDepartment
+     , [Branch] = m.NewBankingCenter
+     , [Date of release] = m.DateOfRelease
+     , [Current salary] = m.CurrentSalary
+FROM Movement m
+${where}
+ORDER BY m.MoveDate DESC, m.FullName
+OPTION (RECOMPILE)`,
+        params,
+    };
+
+    // Summary is deliberately over ALL move types in the same window, not just
+    // the filtered ones: the pack's guidance is to publish the move-type
+    // distribution alongside any promotion figure, which needs the others.
+    const s = makeParams();
+    const summaryWhere = whereOf([
+        ...dateRange(s.add, "m.MoveDate", body.From, body.To),
+        inList(s.add, "m.NewDepartmentId", body.Departments),
+    ]);
+    const summary = {
+        set: "summary",
+        text: `WITH ${MOVEMENT_BODY}
+SELECT [Move type] = m.MoveType
+     , Movements = COUNT(*)
+     , Employees = COUNT(DISTINCT m.UserId)
+     , [Avg years in previous position] = CAST(AVG(m.YearsInPrevPosition) AS decimal(5,1))
+FROM Movement m
+${summaryWhere}
+GROUP BY m.MoveType
+ORDER BY COUNT(*) DESC
+OPTION (RECOMPILE)`,
+        params: s.params,
+    };
+
+    return [detail, summary];
+};
+
+const buildTransfer = (body) => {
+    const { params, add } = makeParams();
+    const where = whereOf([
+        truthy(body.BranchOnly) ? "m.IsBranchMove = 1" : "m.IsTransfer = 1",
+        ...dateRange(add, "m.MoveDate", body.From, body.To),
+        inList(add, "m.PrevDepartmentId", body.FromDepartments),
+        inList(add, "m.NewDepartmentId", body.ToDepartments),
+        present(body.Gender) && String(body.Gender).toLowerCase() !== "all"
+            ? `m.Gender = ${add(sql.VarChar(10), String(body.Gender).trim())}`
+            : null,
+    ]);
+
+    const detail = {
+        set: "detail",
+        text: `WITH ${MOVEMENT_BODY}
+SELECT [ID No.] = m.EmployeeId
+     , [Full name] = m.FullName
+     , Gender = m.Gender
+     , [Move date] = m.MoveDate
+     , [Move type] = m.MoveType
+     , [From department] = m.PrevDepartment
+     , [From branch] = m.PrevBankingCenter
+     , [To department] = m.NewDepartment
+     , [To branch] = m.NewBankingCenter
+     , [Previous position] = m.PrevPosition
+     , [Position] = m.NewPosition
+     , [Date of release] = m.DateOfRelease
+     , [Current salary] = m.CurrentSalary
+FROM Movement m
+${where}
+ORDER BY m.MoveDate DESC, m.FullName
+OPTION (RECOMPILE)`,
+        params,
+    };
+
+    const s = makeParams();
+    const summaryWhere = whereOf([
+        truthy(body.BranchOnly) ? "m.IsBranchMove = 1" : "m.IsTransfer = 1",
+        ...dateRange(s.add, "m.MoveDate", body.From, body.To),
+    ]);
+    const summary = {
+        set: "summary",
+        text: `WITH ${MOVEMENT_BODY}
+SELECT [From department] = m.PrevDepartment
+     , [To department] = m.NewDepartment
+     , Moves = COUNT(*)
+FROM Movement m
+${summaryWhere}
+GROUP BY m.PrevDepartment, m.NewDepartment
+ORDER BY COUNT(*) DESC
+OPTION (RECOMPILE)`,
+        params: s.params,
+    };
+
+    return [detail, summary];
+};
+
+// --- master-based reports --------------------------------------------------
+
+const buildTerminated = (body) => {
+    const { params, add } = makeParams();
+    const where = whereOf([
+        "m.EmploymentStatus = 'Terminated'",
+        ...dateRange(add, "m.TerminationDate", body.From, body.To),
+        inList(add, "m.DepartmentId", body.Departments),
+        inList(add, "m.TerminationReasonId", body.TerminationReasons),
+        present(body.Gender) && String(body.Gender).toLowerCase() !== "all"
+            ? `m.Gender = ${add(sql.VarChar(10), String(body.Gender).trim())}`
+            : null,
+    ]);
+
+    const detail = {
+        set: "detail",
+        text: `${MASTER_CTE}
+SELECT [ID No.] = m.EmployeeId
+     , [Full name] = m.FullName
+     , Gender = m.Gender
+     , Department = m.Department
+     , Position = m.Position
+     , [Job grade] = m.JobGrade
+     , [Employment date] = m.EmploymentDate
+     , [Termination date] = m.TerminationDate
+     , [Termination reason] = m.TerminationReason
+     , [Service years] = m.ServiceYearsDec
+     , [Service at exit] = m.ServiceBand
+     , [Age at exit] = m.Age
+     , [Last salary] = m.Salary
+FROM Master m
+${where}
+ORDER BY m.TerminationDate DESC, m.FullName
+OPTION (RECOMPILE)`,
+        params,
+    };
+
+    const s = makeParams();
+    const summaryWhere = whereOf([
+        "m.EmploymentStatus = 'Terminated'",
+        ...dateRange(s.add, "m.TerminationDate", body.From, body.To),
+        inList(s.add, "m.DepartmentId", body.Departments),
+    ]);
+    const summary = {
+        set: "summary",
+        text: `${MASTER_CTE}
+SELECT [Termination reason] = m.TerminationReason
+     , Leavers = COUNT(*)
+     , [Avg service years] = CAST(AVG(m.ServiceForStats) AS decimal(5,1))
+     , [Avg age] = CAST(AVG(CAST(m.AgeForStats AS decimal(9,2))) AS decimal(5,1))
+     , [Service unknown] = SUM(CASE WHEN m.ServiceForStats IS NULL THEN 1 ELSE 0 END)
+FROM Master m
+${summaryWhere}
+GROUP BY m.TerminationReason
+ORDER BY COUNT(*) DESC
+OPTION (RECOMPILE)`,
+        params: s.params,
+    };
+
+    return [detail, summary];
+};
+
+const buildGeneralPurpose = (body) => {
+    // Same shape as the Explorer's employee list; the filter vocabulary is a
+    // subset of the 55, so buildDetail already understands every field.
+    const built = buildDetail({ ...body, PageSize: 5000, PageNumber: 1 });
+    return [{ set: "detail", text: built.text, params: built.params }];
+};
+
+const buildManpower = (body) => {
+    const levels = {
+        Position: DIMENSIONS.Position,
+        Section: DIMENSIONS.Section,
+        Division: DIMENSIONS.Division,
+        Department: DIMENSIONS.Department,
+    };
+    const level = levels[body.Level] || levels.Position;
+    const levelName = levels[body.Level] ? body.Level : "Position";
+
+    const { params, add } = makeParams();
+    const where = whereOf([
+        (() => {
+            const status = present(body.EmploymentStatus)
+                ? String(body.EmploymentStatus).trim()
+                : "Active";
+            return status.toLowerCase() === "all"
+                ? null
+                : `m.EmploymentStatus = ${add(sql.VarChar(20), status)}`;
+        })(),
+        inList(add, "m.PresidentId", body.Presidents),
+        inList(add, "m.DepartmentId", body.Departments),
+        inList(add, "m.BankingCenterId", body.BankingCenters),
+    ]);
+
+    const structure = {
+        set: "structure",
+        text: `${MASTER_CTE}
+SELECT President = m.President
+     , Department = m.Department
+     , [${levelName}] = ${level.label}
+     , Headcount = COUNT(*)
+     , Male = SUM(CASE WHEN m.Gender = 'Male' THEN 1 ELSE 0 END)
+     , Female = SUM(CASE WHEN m.Gender = 'Female' THEN 1 ELSE 0 END)
+     , [Avg age] = CAST(AVG(CAST(m.AgeForStats AS decimal(9,2))) AS decimal(5,1))
+     , [Avg service years] = CAST(AVG(m.ServiceForStats) AS decimal(5,1))
+     , [Avg salary] = CAST(AVG(m.Salary) AS decimal(18,2))
+FROM Master m
+${where}
+GROUP BY m.President, m.Department, ${level.label}
+ORDER BY m.President, m.Department, ${level.label}
+OPTION (RECOMPILE)`,
+        params,
+    };
+
+    const s = makeParams();
+    const totalWhere = whereOf([
+        (() => {
+            const status = present(body.EmploymentStatus)
+                ? String(body.EmploymentStatus).trim()
+                : "Active";
+            return status.toLowerCase() === "all"
+                ? null
+                : `m.EmploymentStatus = ${s.add(sql.VarChar(20), status)}`;
+        })(),
+        inList(s.add, "m.PresidentId", body.Presidents),
+        inList(s.add, "m.DepartmentId", body.Departments),
+        inList(s.add, "m.BankingCenterId", body.BankingCenters),
+    ]);
+    const summary = {
+        set: "summary",
+        text: `${MASTER_CTE}
+SELECT [Total headcount] = COUNT(*)
+     , Departments = COUNT(DISTINCT m.Department)
+     , Positions = COUNT(DISTINCT m.Position)
+     , Branches = COUNT(DISTINCT m.BankingCenter)
+     , Male = SUM(CASE WHEN m.Gender = 'Male' THEN 1 ELSE 0 END)
+     , Female = SUM(CASE WHEN m.Gender = 'Female' THEN 1 ELSE 0 END)
+FROM Master m
+${totalWhere}
+OPTION (RECOMPILE)`,
+        params: s.params,
+    };
+
+    return [structure, summary];
+};
+
+const buildDiscipline = (body) => {
+    const { params, add } = makeParams();
+    const today = new Date();
+    const where = whereOf([
+        ...dateRange(add, "d.IssueDate", body.From, body.To),
+        inList(add, "m.DepartmentId", body.Departments),
+        truthy(body.ActiveOnly) ? `d.EndDate >= ${add(sql.Date, today)}` : null,
+    ]);
+    const pToday = add(sql.Date, today);
+
+    const detail = {
+        set: "detail",
+        text: `${MASTER_CTE}
+SELECT [ID No.] = m.EmployeeId
+     , [Full name] = m.FullName
+     , Gender = m.Gender
+     , Department = m.Department
+     , Position = m.Position
+     , [Action taken] = ISNULL(a.[Action], '(Not recorded)')
+     , [Issue date] = d.IssueDate
+     , [End date] = d.EndDate
+     , [Duration days] = DATEDIFF(DAY, d.IssueDate, d.EndDate)
+     , [Status] = CASE WHEN d.EndDate >= ${pToday} THEN 'In force' ELSE 'Expired' END
+     , [Employment status] = m.EmploymentStatus
+FROM dbo.Discipline d
+JOIN Master m ON m.UserId = d.UserId
+LEFT JOIN dbo.luActionTaken a ON a.Id = d.BreachType
+${where}
+ORDER BY d.IssueDate DESC, m.FullName
+OPTION (RECOMPILE)`,
+        params,
+    };
+
+    const s = makeParams();
+    const summaryWhere = whereOf(dateRange(s.add, "d.IssueDate", body.From, body.To));
+    const sToday = s.add(sql.Date, today);
+    const summary = {
+        set: "summary",
+        text: `SELECT [Action taken] = ISNULL(a.[Action], '(Not recorded)')
+     , Cases = COUNT(*)
+     , Employees = COUNT(DISTINCT d.UserId)
+     , [In force] = SUM(CASE WHEN d.EndDate >= ${sToday} THEN 1 ELSE 0 END)
+     , [Avg duration days] = AVG(DATEDIFF(DAY, d.IssueDate, d.EndDate))
+FROM dbo.Discipline d
+LEFT JOIN dbo.luActionTaken a ON a.Id = d.BreachType
+${summaryWhere}
+GROUP BY a.[Action]
+ORDER BY COUNT(*) DESC
+OPTION (RECOMPILE)`,
+        params: s.params,
+    };
+
+    return [detail, summary];
+};
+
+const buildTurnover = (body) => {
+    const leaversParams = makeParams();
+    const leaversWhere = whereOf([
+        "m.EmploymentStatus = 'Terminated'",
+        ...dateRange(leaversParams.add, "m.TerminationDate", body.From, body.To),
+        inList(leaversParams.add, "m.DepartmentId", body.Departments),
+    ]);
+
+    const leavers = {
+        set: "leavers",
+        text: `${MASTER_CTE}
+SELECT [ID No.] = m.EmployeeId
+     , [Full name] = m.FullName
+     , Gender = m.Gender
+     , Department = m.Department
+     , [Employment date] = m.EmploymentDate
+     , [Termination date] = m.TerminationDate
+     , [Termination reason] = m.TerminationReason
+     , [Service at exit] = m.ServiceBand
+     , [Service years] = m.ServiceYearsDec
+     , [Last salary] = m.Salary
+FROM Master m
+${leaversWhere}
+ORDER BY m.TerminationDate DESC, m.FullName
+OPTION (RECOMPILE)`,
+        params: leaversParams.params,
+    };
+
+    const bandParams = makeParams();
+    const bandWhere = whereOf([
+        "m.EmploymentStatus = 'Terminated'",
+        ...dateRange(bandParams.add, "m.TerminationDate", body.From, body.To),
+        inList(bandParams.add, "m.DepartmentId", body.Departments),
+    ]);
+    const byBand = {
+        set: "byReason",
+        text: `${MASTER_CTE}
+SELECT [Service at exit] = m.ServiceBand
+     , Leavers = COUNT(*)
+     , [Avg service years] = CAST(AVG(m.ServiceForStats) AS decimal(5,1))
+     , [Top reason] = MIN(m.TerminationReason)
+FROM Master m
+${bandWhere}
+GROUP BY m.ServiceBand
+ORDER BY COUNT(*) DESC
+OPTION (RECOMPILE)`,
+        params: bandParams.params,
+    };
+
+    // The rate itself is exactly the Explorer's movement series.
+    const series = buildMovement({
+        From: body.From,
+        To: body.To,
+        Period: body.Period || "Year",
+        GroupBy: body.GroupBy,
+        Departments: body.Departments,
+    });
+
+    return [leavers, byBand, { set: "series", text: series.text, params: series.params }];
+};
+
+const buildMonthly = (body) => {
+    const year = Number(body.Year) || new Date().getFullYear();
+    const month = Math.min(12, Math.max(1, Number(body.Month) || new Date().getMonth() + 1));
+    const start = new Date(Date.UTC(year, month - 1, 1));
+    const end = new Date(Date.UTC(year, month, 0));
+
+    const mk = (setName, selectSql, extra) => {
+        const { params, add } = makeParams();
+        const pStart = add(sql.Date, start);
+        const pEnd = add(sql.Date, end);
+        const dept = inList(add, "m.DepartmentId", body.Departments);
+        return {
+            set: setName,
+            text: selectSql(pStart, pEnd, dept ? `AND ${dept}` : ""),
+            params,
+            ...extra,
+        };
+    };
+
+    const joiners = mk(
+        "joiners",
+        (s, e, dept) => `${MASTER_CTE}
+SELECT [ID No.] = m.EmployeeId, [Full name] = m.FullName, Gender = m.Gender
+     , Department = m.Department, Position = m.Position, [Job grade] = m.JobGrade
+     , [Employment date] = m.EmploymentDate, Salary = m.Salary
+FROM Master m
+WHERE m.EmploymentDate BETWEEN ${s} AND ${e} ${dept}
+ORDER BY m.EmploymentDate, m.FullName
+OPTION (RECOMPILE)`
+    );
+
+    const leavers = mk(
+        "leavers",
+        (s, e, dept) => `${MASTER_CTE}
+SELECT [ID No.] = m.EmployeeId, [Full name] = m.FullName, Gender = m.Gender
+     , Department = m.Department, Position = m.Position
+     , [Termination date] = m.TerminationDate, [Termination reason] = m.TerminationReason
+     , [Service years] = m.ServiceYearsDec
+FROM Master m
+WHERE m.TerminationDate BETWEEN ${s} AND ${e} ${dept}
+ORDER BY m.TerminationDate, m.FullName
+OPTION (RECOMPILE)`
+    );
+
+    const movements = (() => {
+        const { params, add } = makeParams();
+        const pStart = add(sql.Date, start);
+        const pEnd = add(sql.Date, end);
+        const dept = inList(add, "m.NewDepartmentId", body.Departments);
+        return {
+            set: "movements",
+            text: `WITH ${MOVEMENT_BODY}
+SELECT [ID No.] = m.EmployeeId, [Full name] = m.FullName
+     , [Move date] = m.MoveDate, [Move type] = m.MoveType
+     , [Previous position] = m.PrevPosition, [Position] = m.NewPosition
+     , [Previous department] = m.PrevDepartment, [Department] = m.NewDepartment
+FROM Movement m
+WHERE m.MoveDate BETWEEN ${pStart} AND ${pEnd} ${dept ? `AND ${dept}` : ""}
+ORDER BY m.MoveDate, m.FullName
+OPTION (RECOMPILE)`,
+            params,
+        };
+    })();
+
+    const byDepartment = mk(
+        "byDepartment",
+        (s, e, dept) => `${MASTER_CTE}
+SELECT Department = m.Department
+     , [Opening] = SUM(CASE WHEN m.EmploymentDate < ${s}
+                             AND (m.TerminationDate IS NULL OR m.TerminationDate >= ${s})
+                            THEN 1 ELSE 0 END)
+     , Joiners = SUM(CASE WHEN m.EmploymentDate BETWEEN ${s} AND ${e} THEN 1 ELSE 0 END)
+     , Leavers = SUM(CASE WHEN m.TerminationDate BETWEEN ${s} AND ${e} THEN 1 ELSE 0 END)
+     , [Closing] = SUM(CASE WHEN m.EmploymentDate <= ${e}
+                             AND (m.TerminationDate IS NULL OR m.TerminationDate > ${e})
+                            THEN 1 ELSE 0 END)
+FROM Master m
+WHERE 1 = 1 ${dept}
+GROUP BY m.Department
+HAVING SUM(CASE WHEN m.EmploymentDate <= ${e}
+                 AND (m.TerminationDate IS NULL OR m.TerminationDate > ${e})
+                THEN 1 ELSE 0 END) > 0
+ORDER BY m.Department
+OPTION (RECOMPILE)`
+    );
+
+    const summary = mk(
+        "summary",
+        (s, e, dept) => `${MASTER_CTE}
+SELECT [Period start] = ${s}, [Period end] = ${e}
+     , [Opening headcount] = SUM(CASE WHEN m.EmploymentDate < ${s}
+                                       AND (m.TerminationDate IS NULL OR m.TerminationDate >= ${s})
+                                      THEN 1 ELSE 0 END)
+     , Joiners = SUM(CASE WHEN m.EmploymentDate BETWEEN ${s} AND ${e} THEN 1 ELSE 0 END)
+     , Leavers = SUM(CASE WHEN m.TerminationDate BETWEEN ${s} AND ${e} THEN 1 ELSE 0 END)
+     , [Closing headcount] = SUM(CASE WHEN m.EmploymentDate <= ${e}
+                                       AND (m.TerminationDate IS NULL OR m.TerminationDate > ${e})
+                                      THEN 1 ELSE 0 END)
+FROM Master m
+WHERE 1 = 1 ${dept}
+OPTION (RECOMPILE)`
+    );
+
+    return [joiners, leavers, movements, byDepartment, summary];
+};
+
+// Grouped headcount reports are the Explorer's Summary with the group-by
+// fixed, so they delegate rather than restate a forty-line aggregate.
+const buildGrouped = (dimension) => (body) => {
+    const shared = {
+        EmploymentStatus: body.EmploymentStatus,
+        Gender: body.Gender,
+        IncludePercentiles: body.IncludePercentiles,
+        GroupBy1: dimension,
+        GroupBy2: present(body.SplitBy) && DIMENSIONS[body.SplitBy] ? body.SplitBy : "",
+        OrderBy: "Headcount",
+    };
+    const groups = buildSummary(shared);
+    const total = buildSummaryTotal(shared);
+    return [
+        { set: "groups", text: groups.text, params: groups.params },
+        { set: "total", text: total.text, params: total.params },
+    ];
+};
+
+export const STANDARD_REPORT_BUILDERS = {
+    promotion: buildPromotion,
+    transfer: buildTransfer,
+    terminated: buildTerminated,
+    monthly: buildMonthly,
+    manpower: buildManpower,
+    general: buildGeneralPurpose,
+    "by-department": buildGrouped("Department"),
+    "by-job-category": buildGrouped("JobCategory"),
+    "by-marital-status": buildGrouped("MaritalStatus"),
+    discipline: buildDiscipline,
+    turnover: buildTurnover,
 };
 
 export { sql };
