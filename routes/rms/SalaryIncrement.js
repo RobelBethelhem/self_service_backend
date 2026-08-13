@@ -6,6 +6,11 @@ import roleCheck from "../../middleware/rms/roleCheck.js";
 import User from "../../models/rms/User.js";
 import SalaryIncrementLetter from "../../models/rms/SalaryIncrementLetter.js";
 import SalaryIncrementImport from "../../models/rms/SalaryIncrementImport.js";
+// Dormant: the per-letter reference counter was retired when the letter moved
+// to the admin's batch reference. The import stays so the commented-out
+// generation in /mark-printed and /admin-prepare-print can be switched back on
+// without hunting for it.
+// eslint-disable-next-line no-unused-vars
 import SalaryIncrementCounter from "../../models/rms/SalaryIncrementCounter.js";
 import SalaryCommitmentPeriod from "../../models/rms/SalaryCommitmentPeriod.js";
 import SalaryCommitmentDecision from "../../models/rms/SalaryCommitmentDecision.js";
@@ -89,6 +94,18 @@ router.post(
             const fiscal_year = Number(req.body.fiscal_year);
             if (!Number.isFinite(fiscal_year) || fiscal_year < 2000 || fiscal_year > 3000) {
                 return res.status(400).json({ error: true, message: "fiscal_year is required and must be a valid year" });
+            }
+
+            // The Board's decision-document number, printed on every letter in
+            // this batch. Required: it is the only reference the letter has,
+            // and a blank one would ship letters with an empty Ref. No. line.
+            const reference_number = String(req.body.reference_number || "").trim().slice(0, 60);
+            if (!reference_number) {
+                return res.status(400).json({
+                    error: true,
+                    message:
+                        "reference_number is required — it is the Board decision number printed on every letter in this batch (e.g. ZB/HC/2198/2025)",
+                });
             }
 
             const effective_date = parseDate(req.body.effective_date);
@@ -208,6 +225,7 @@ router.post(
             // ---------- create batch ----------
             const batch = await new SalaryIncrementImport({
                 fiscal_year,
+                reference_number,
                 effective_date,
                 board_meeting_date,
                 letter_date,
@@ -329,6 +347,72 @@ router.post(
 // If the period already exists for the FY, dates are updated in place
 // (this is how admins extend the deadline).
 // ============================================================
+// ============================================================
+// PATCH /batch-reference — set or correct a batch's reference number
+// Body: { fiscal_year, reference_number }
+// ============================================================
+// Exists so an already-imported year can be given its reference without
+// re-importing. Re-importing is destructive — overwrite deletes every letter
+// for the fiscal year — so it is the wrong tool for fixing one field, and
+// batches imported before reference_number existed would otherwise be stuck
+// printing a blank Ref. No.
+//
+// Every letter in the batch reads through to this, so a correction here is
+// immediately reflected on all of them and on the public verify page.
+router.patch("/batch-reference", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const fiscal_year = Number((req.body || {}).fiscal_year);
+        if (!Number.isFinite(fiscal_year)) {
+            return res.status(400).json({ error: true, message: "fiscal_year is required" });
+        }
+
+        const reference_number = String((req.body || {}).reference_number || "")
+            .trim()
+            .slice(0, 60);
+        if (!reference_number) {
+            return res
+                .status(400)
+                .json({ error: true, message: "reference_number is required" });
+        }
+
+        const user = await User.findOne({ _id: req.user._id });
+        const batch = await SalaryIncrementImport.findOneAndUpdate(
+            { fiscal_year },
+            {
+                $set: {
+                    reference_number,
+                    reference_updated_by: (user && user.user) || "unknown",
+                    reference_updated_at: new Date(),
+                },
+            },
+            { new: true }
+        ).lean();
+
+        if (!batch) {
+            return res.status(404).json({
+                error: true,
+                message: `No salary increment batch imported for FY ${fiscal_year}`,
+            });
+        }
+
+        const letters = await SalaryIncrementLetter.countDocuments({ fiscal_year });
+        console.log(
+            `[salary-increment] FY ${fiscal_year} reference set to "${reference_number}" ` +
+            `by ${(user && user.user) || "unknown"} — affects ${letters} letter(s)`
+        );
+
+        return res.json({
+            error: false,
+            message: `Reference number set for FY ${fiscal_year}. It now appears on all ${letters} letter${letters === 1 ? "" : "s"} in this batch.`,
+            batch,
+            letters_affected: letters,
+        });
+    } catch (e) {
+        console.error("Salary /batch-reference error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
 router.post("/period", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const fiscal_year = Number(req.body.fiscal_year);
@@ -943,13 +1027,30 @@ router.post("/mark-printed", auth, roleCheck(["user", "admin"]), async (req, res
             });
         }
 
-        // Assign the system reference number on first print (any caller).
-        // Subsequent prints reuse the same value, so the QR code, the
-        // printed reference, and the public verify page all line up.
-        if (!letter.reference_number) {
-            letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
-            letter.reference_number_assigned_at = new Date();
-        }
+        // ---------------------------------------------------------------
+        // RETIRED: per-letter reference generated on first print.
+        //
+        // The letter now carries the batch reference the admin types in at
+        // import time — one number for the whole batch, present whether or not
+        // anyone prints, exactly like the effective / board-meeting / letter
+        // dates beside it.
+        //
+        // This also fixes a real mismatch: the public verify page has always
+        // read import_batch_id.reference_number, so a printed letter showed
+        // ZB/HC/INC/00001/2026 while scanning its own QR code showed the
+        // batch number instead. The two now agree.
+        //
+        // Left in place rather than deleted so the per-letter counter can be
+        // brought back without rewriting it. Nothing else references it —
+        // SalaryIncrementCounter and the letter's reference_number /
+        // reference_number_assigned_at fields are now dormant, and rows that
+        // already have a value keep it harmlessly.
+        //
+        // if (!letter.reference_number) {
+        //     letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
+        //     letter.reference_number_assigned_at = new Date();
+        // }
+        // ---------------------------------------------------------------
 
         const now = new Date();
         letter.printed_count = (letter.printed_count || 0) + 1;
@@ -957,9 +1058,14 @@ router.post("/mark-printed", auth, roleCheck(["user", "admin"]), async (req, res
         if (!letter.first_printed_at) letter.first_printed_at = now;
         await letter.save();
 
+        // Same as /admin-prepare-print: the reference reported back is the
+        // batch's, kept in the response only for older clients.
+        const printBatch = await SalaryIncrementImport.findById(letter.import_batch_id).lean();
+
         return res.json({
             error: false,
-            reference_number: letter.reference_number,
+            reference_number:
+                (printBatch && printBatch.reference_number) || letter.reference_number || null,
             printed_count: letter.printed_count,
             first_printed_at: letter.first_printed_at,
             last_printed_at: letter.last_printed_at,
@@ -995,15 +1101,24 @@ router.post("/admin-prepare-print", auth, roleCheck(["admin"]), async (req, res)
             });
         }
 
-        if (!letter.reference_number) {
-            letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
-            letter.reference_number_assigned_at = new Date();
-            await letter.save();
-        }
+        // RETIRED with the same reasoning as /mark-printed above — the letter
+        // now shows the admin's batch reference, so there is nothing to assign
+        // before an archive copy is printed. Kept commented rather than
+        // deleted.
+        //
+        // if (!letter.reference_number) {
+        //     letter.reference_number = await SalaryIncrementCounter.getNextReference(letter.fiscal_year);
+        //     letter.reference_number_assigned_at = new Date();
+        //     await letter.save();
+        // }
+
+        // Still answers with a reference so an older client that expects one
+        // keeps working — it is just the batch's now, not a generated value.
+        const batch = await SalaryIncrementImport.findById(letter.import_batch_id).lean();
 
         return res.json({
             error: false,
-            reference_number: letter.reference_number,
+            reference_number: (batch && batch.reference_number) || letter.reference_number || null,
         });
     } catch (e) {
         console.error("Salary /admin-prepare-print error:", e);
