@@ -1268,41 +1268,53 @@ router.post("/admin-prepare-print", auth, roleCheck(["admin"]), async (req, res)
 // GET /list — admin oversight, material-react-table compatible
 // Query: ?fiscal_year, ?category, ?status, ?domain_user, ?page, ?limit
 // ============================================================
+// Builds the Mongo filter for a letter listing from the query string.
+//
+// Shared by /list (paginated, feeds the table) and /export-data (unpaginated,
+// feeds the bulk PDF archive). They must select exactly the same rows: an
+// export that quietly differs from what the admin is looking at on screen is
+// the worst possible bug in an audit feature, so there is one implementation.
+const buildLetterFilter = async (query) => {
+    const filter = {};
+    if (query.fiscal_year) {
+        const fy = Number(query.fiscal_year);
+        if (Number.isFinite(fy)) filter.fiscal_year = fy;
+    }
+    if (query.category) filter.category = String(query.category);
+    if (query.status) filter.status = String(query.status);
+    if (query.domain_user) {
+        filter.domain_user = {
+            $regex: escapeRegex(String(query.domain_user)),
+            $options: "i",
+        };
+    }
+
+    // General search across domain_user, employee_name, first_name, AND the
+    // populated batch's reference_number. Lets admins find a row when they
+    // know any one of those identifiers.
+    if (query.q) {
+        const q = escapeRegex(String(query.q));
+        const matchingBatches = await SalaryIncrementImport.find(
+            { reference_number: { $regex: q, $options: "i" } },
+            { _id: 1 }
+        ).lean();
+        const orClauses = [
+            { domain_user: { $regex: q, $options: "i" } },
+            { employee_name: { $regex: q, $options: "i" } },
+            { first_name: { $regex: q, $options: "i" } },
+        ];
+        if (matchingBatches.length) {
+            orClauses.push({ import_batch_id: { $in: matchingBatches.map((b) => b._id) } });
+        }
+        filter.$or = orClauses;
+    }
+
+    return filter;
+};
+
 router.get("/list", auth, roleCheck(["admin"]), async (req, res) => {
     try {
-        const filter = {};
-        if (req.query.fiscal_year) {
-            const fy = Number(req.query.fiscal_year);
-            if (Number.isFinite(fy)) filter.fiscal_year = fy;
-        }
-        if (req.query.category) filter.category = String(req.query.category);
-        if (req.query.status) filter.status = String(req.query.status);
-        if (req.query.domain_user) {
-            filter.domain_user = {
-                $regex: escapeRegex(String(req.query.domain_user)),
-                $options: "i",
-            };
-        }
-
-        // General search across domain_user, employee_name, first_name, AND the
-        // populated batch's reference_number. Lets admins find a row when they
-        // know any one of those identifiers.
-        if (req.query.q) {
-            const q = escapeRegex(String(req.query.q));
-            const matchingBatches = await SalaryIncrementImport.find(
-                { reference_number: { $regex: q, $options: "i" } },
-                { _id: 1 }
-            ).lean();
-            const orClauses = [
-                { domain_user: { $regex: q, $options: "i" } },
-                { employee_name: { $regex: q, $options: "i" } },
-                { first_name: { $regex: q, $options: "i" } },
-            ];
-            if (matchingBatches.length) {
-                orClauses.push({ import_batch_id: { $in: matchingBatches.map((b) => b._id) } });
-            }
-            filter.$or = orClauses;
-        }
+        const filter = await buildLetterFilter(req.query);
 
         const page = Math.max(1, Number(req.query.page) || 1);
         const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
@@ -1320,6 +1332,70 @@ router.get("/list", auth, roleCheck(["admin"]), async (req, res) => {
         return res.json({ data, meta: { totalRowCount } });
     } catch (e) {
         console.error("Salary /list error:", e);
+        return res.status(500).json({ error: true, message: "Internal Server Error" });
+    }
+});
+
+// ============================================================
+// GET /export-data — admin-only, every letter matching the filter, unpaginated.
+//
+// Feeds the "Download All Letters (PDF)" archive on the list page. The browser
+// renders the PDFs itself (it already owns the letter layout, and doing it
+// client-side keeps the wording in one place rather than reimplementing the
+// legal text server-side), so all this has to do is hand over the rows.
+//
+// Deliberately one request rather than the ~13 paged calls /list would need for
+// a full fiscal year. Same filter builder as /list, so the archive contains
+// exactly the rows the admin can see in the table — never a different set.
+//
+// Query: ?fiscal_year, ?category, ?status, ?domain_user, ?q
+// ============================================================
+
+// A 2,500-employee year is the real workload; 10,000 covers several years at
+// once with room to spare while still refusing to serve an unbounded query.
+const EXPORT_CAP = 10000;
+
+router.get("/export-data", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const filter = await buildLetterFilter(req.query);
+
+        // One extra row is fetched purely to detect truncation, then dropped —
+        // cheaper than a separate countDocuments over the same filter.
+        const rows = await SalaryIncrementLetter.find(filter)
+            .populate("import_batch_id")
+            .sort({ fiscal_year: -1, employee_name: 1, domain_user: 1 })
+            .limit(EXPORT_CAP + 1)
+            .lean();
+
+        const truncated = rows.length > EXPORT_CAP;
+        const data = truncated ? rows.slice(0, EXPORT_CAP) : rows;
+
+        // The JWT carries only an id and roles, so resolve the username here for
+        // the archive's README — an audit archive should say who pulled it.
+        let exportedBy = "";
+        try {
+            const me = await User.findById(req.user._id, { user: 1 }).lean();
+            exportedBy = (me && me.user) || "";
+        } catch {
+            /* the archive is still valid without it */
+        }
+
+        console.log(
+            `[salary-increment] /export-data by ${exportedBy || req.user._id}: ` +
+                `${data.length} letters${truncated ? ` (capped at ${EXPORT_CAP})` : ""}`
+        );
+
+        return res.json({
+            data,
+            meta: {
+                count: data.length,
+                truncated,
+                cap: EXPORT_CAP,
+                exported_by: exportedBy,
+            },
+        });
+    } catch (e) {
+        console.error("Salary /export-data error:", e);
         return res.status(500).json({ error: true, message: "Internal Server Error" });
     }
 });
