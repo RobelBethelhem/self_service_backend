@@ -45,6 +45,57 @@ const parseDate = (v) => {
 
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Push notifications for a completed import, sent AFTER the response has gone
+// out rather than inside the request.
+//
+// Sending them inline is what put a ceiling on the import. Each sendToUser
+// does a subscription lookup plus an outbound HTTPS call to the push service,
+// so at a realistic 200 ms per employee, 2,500 of them is over eight minutes
+// of sequential waiting with the admin's request held open the whole time.
+//
+// Whether a given deployment has a hard timeout in front of it hardly matters:
+// a request that long will eventually meet a proxy, a pool recycle or a
+// dropped connection, and when it does the admin sees a failed import that had
+// in fact written every letter — so they retry and hit the already-imported
+// guard, or overwrite and do it all again.
+//
+// Notifications are best-effort by existing convention throughout this
+// codebase, which makes them a poor reason to hold a request open at all.
+// Waves of 25 keep the push service and the connection pool from being
+// flooded while still clearing a few thousand in well under a minute.
+const notifyImportedUsers = async (fiscal_year, recipients) => {
+    const WAVE = 25;
+    let sent = 0;
+    let failed = 0;
+
+    for (let i = 0; i < recipients.length; i += WAVE) {
+        const wave = recipients.slice(i, i + WAVE);
+        // eslint-disable-next-line no-await-in-loop
+        const results = await Promise.allSettled(
+            wave.map(({ doc, user }) =>
+                PushNotificationService.sendToUser(user._id, {
+                    title: "Salary Increment Letter Ready",
+                    body: `Your FY ${fiscal_year} salary increment letter is available. Sign in to review and accept the commitment.`,
+                    data: {
+                        type: "salary-increment",
+                        fiscal_year,
+                        letter_id: String(doc._id),
+                        url: "/user/salary-increment",
+                    },
+                })
+            )
+        );
+        results.forEach((r) => {
+            if (r.status === "fulfilled") sent += 1;
+            else failed += 1;
+        });
+    }
+
+    console.log(
+        `[salary-increment] FY ${fiscal_year} notifications finished: ${sent} sent, ${failed} failed`
+    );
+};
+
 const CAT_KEY = {
     Full: "full",
     Proportionate: "proportionate",
@@ -172,10 +223,29 @@ router.post(
             }
 
             // ---------- batch user lookup (case-insensitive) ----------
+            // One query, matched in JavaScript, rather than an $in of one
+            // case-insensitive regex per row.
+            //
+            // /^name$/i cannot use an index, so the old form made MongoDB scan
+            // the whole collection and evaluate every regex against every
+            // document — at 2,500 rows against ~2,500 staff that is over six
+            // million regex evaluations for a lookup that is really just a
+            // dictionary. Pulling four fields for the user list once and
+            // matching on a lowercased Map is a single indexed-free scan and
+            // finishes in milliseconds.
             const usernames = [...new Set(dedupedRows.map((r) => r.domain_user))];
-            const userRegexes = usernames.map((n) => new RegExp("^" + escapeRegex(n) + "$", "i"));
-            const users = userRegexes.length ? await User.find({ user: { $in: userRegexes } }) : [];
-            const userByLower = new Map(users.map((u) => [String(u.user).toLowerCase(), u]));
+            const wantedLower = new Set(usernames.map((n) => String(n).toLowerCase()));
+            const userByLower = new Map();
+            if (wantedLower.size) {
+                const allUsers = await User.find(
+                    {},
+                    { user: 1, first_name: 1, last_name: 1, employee_id: 1 }
+                ).lean();
+                for (const u of allUsers) {
+                    const key = String(u.user || "").toLowerCase();
+                    if (wantedLower.has(key)) userByLower.set(key, u);
+                }
+            }
 
             const validRows = [];
             for (const row of dedupedRows) {
@@ -232,8 +302,10 @@ router.post(
                 imported_by: adminUser.user,
             }).save();
 
-            // ---------- save letters one-by-one (collect per-row errors without aborting) ----------
-            const inserted = [];
+            // ---------- build the documents ----------
+            // Decisions and bonus adjustments are resolved in memory first, so
+            // the database work below is pure writing.
+            const pending = [];
             const insertErrors = [];
             const skippedNoDecision = [];
             for (const row of validRows) {
@@ -263,8 +335,13 @@ router.post(
                     }
                 }
 
-                try {
-                    const doc = await new SalaryIncrementLetter({
+                pending.push({
+                    // Kept alongside the document so a write error can be
+                    // reported against the spreadsheet row it came from.
+                    meta: { sheet, category: row.category, excel_row, domain_user: row.domain_user },
+                    user: _user,
+                    decision: dec.decision,
+                    doc: {
                         ...fields,
                         fiscal_year,
                         import_batch_id: batch._id,
@@ -272,18 +349,87 @@ router.post(
                         status: "Committed",
                         commitment_decision: dec.decision,
                         commitment_decided_at: dec.decided_at,
-                    }).save();
-                    inserted.push({ doc, user: _user, decision: dec.decision });
+                    },
+                });
+            }
+
+            // ---------- write them in chunks ----------
+            // Previously one await .save() per row: 2,500 rows meant 2,500
+            // sequential round trips. insertMany sends a chunk per round trip.
+            //
+            // ordered:false so one bad row cannot abort the rest — the whole
+            // point of the original loop — and the driver reports each failure
+            // with its index within the chunk, which maps back to the
+            // spreadsheet row. Chunked rather than one huge call so memory and
+            // the write stay bounded, and so the log shows progress on a long
+            // import.
+            const INSERT_CHUNK = 500;
+            const inserted = [];
+
+            for (let start = 0; start < pending.length; start += INSERT_CHUNK) {
+                const slice = pending.slice(start, start + INSERT_CHUNK);
+
+                try {
+                    // eslint-disable-next-line no-await-in-loop
+                    const docs = await SalaryIncrementLetter.insertMany(
+                        slice.map((p) => p.doc),
+                        { ordered: false }
+                    );
+                    docs.forEach((doc, i) => {
+                        inserted.push({ doc, user: slice[i].user, decision: slice[i].decision });
+                    });
                 } catch (e) {
-                    insertErrors.push({
-                        sheet,
-                        category: row.category,
-                        excel_row,
-                        domain_user: row.domain_user,
-                        reason: e.code === 11000 ? "duplicate_key" : "insert_failed",
-                        details: e.message,
+                    // ordered:false means the driver carries on past a bad row,
+                    // so a throw here is a partial result, not a dead chunk.
+                    //
+                    // Reconciled by domain_user rather than by trusting any one
+                    // error shape: a duplicate key arrives as writeErrors, a
+                    // schema violation as a mongoose validation error, and the
+                    // two report differently. Matching on what actually landed
+                    // means every row is either counted as inserted or reported
+                    // as failed — none can fall silently between the two.
+                    // domain_user is unique per fiscal year and the rows were
+                    // already deduplicated, so it identifies a row exactly.
+                    const okDocs = e.insertedDocs || [];
+                    const insertedByUser = new Map(
+                        okDocs.map((d) => [String(d.domain_user).toLowerCase(), d])
+                    );
+
+                    // Itemised reasons, where the driver gave them.
+                    const writeErrors = e.writeErrors || (e.result && e.result.writeErrors) || [];
+                    const reasonByIndex = new Map();
+                    writeErrors.forEach((we) => {
+                        const idx = typeof we.index === "number" ? we.index : we.err && we.err.index;
+                        const code = we.code || (we.err && we.err.code);
+                        if (typeof idx === "number") {
+                            reasonByIndex.set(idx, {
+                                reason: code === 11000 ? "duplicate_key" : "insert_failed",
+                                details: (we.errmsg || (we.err && we.err.errmsg) || "").slice(0, 300),
+                            });
+                        }
+                    });
+
+                    slice.forEach((p, i) => {
+                        const landed = insertedByUser.get(String(p.doc.domain_user).toLowerCase());
+                        if (landed) {
+                            inserted.push({ doc: landed, user: p.user, decision: p.decision });
+                            return;
+                        }
+                        const detail = reasonByIndex.get(i);
+                        insertErrors.push({
+                            ...p.meta,
+                            reason: (detail && detail.reason) || "insert_failed",
+                            details:
+                                (detail && detail.details) ||
+                                (e.message || "Write failed").slice(0, 300),
+                        });
                     });
                 }
+
+                console.log(
+                    `[salary-increment] FY ${fiscal_year} import: ` +
+                    `${Math.min(start + INSERT_CHUNK, pending.length)}/${pending.length} rows written`
+                );
             }
 
             // ---------- counts + batch summary ----------
@@ -296,29 +442,11 @@ router.post(
             batch.per_category_counts = counts;
             await batch.save();
 
-            // ---------- push notify each successfully imported user ----------
-            // Best-effort: errors are swallowed (existing convention across the codebase).
-            const notif = { sent: 0, failed: 0 };
-            for (const { doc, user } of inserted) {
-                try {
-                    const payload = {
-                        title: "Salary Increment Letter Ready",
-                        body: `Your FY ${fiscal_year} salary increment letter is available. Sign in to review and accept the commitment.`,
-                        data: {
-                            type: "salary-increment",
-                            fiscal_year,
-                            letter_id: String(doc._id),
-                            url: "/user/salary-increment",
-                        },
-                    };
-                    await PushNotificationService.sendToUser(user._id, payload);
-                    notif.sent++;
-                } catch (_) {
-                    notif.failed++;
-                }
-            }
-
-            return res.status(201).json({
+            // ---------- respond, then notify ----------
+            // The letters are written and the batch is committed at this point,
+            // so the admin's answer does not wait on the push service. See
+            // notifyImportedUsers for why that matters at this size.
+            res.status(201).json({
                 error: false,
                 message: `Imported ${inserted.length} salary increment letter(s) for fiscal year ${fiscal_year}`,
                 batch_id: batch._id,
@@ -330,10 +458,20 @@ router.post(
                 per_category: counts,
                 sheet_warnings,
                 row_errors: [...row_errors, ...insertErrors],
-                notifications_sent: notif.sent,
-                notifications_failed: notif.failed,
+                notifications_queued: inserted.length,
                 overwritten: Boolean(existingBatch && overwrite),
             });
+
+            // Deliberately not awaited — the response is already sent. Errors
+            // are logged rather than thrown so a push failure cannot surface as
+            // an unhandled rejection and take the worker down under iisnode.
+            notifyImportedUsers(
+                fiscal_year,
+                inserted.map(({ doc, user }) => ({ doc, user }))
+            ).catch((e) =>
+                console.error("Salary import notification sweep failed:", e && e.message)
+            );
+            return undefined;
         } catch (e) {
             console.error("Salary import error:", e);
             return res.status(500).json({ error: true, message: "Internal Server Error" });
