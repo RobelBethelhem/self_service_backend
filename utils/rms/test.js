@@ -973,4 +973,143 @@ const getRatingProfile = async (username, employeeId) => {
     }
 };
 
-export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeDirectory, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, getRatingProfile, _sanitizeHris };
+// ---------------------------------------------------------------------------
+// Exit clearance: HRIS termination
+// ---------------------------------------------------------------------------
+//
+// HRIS keeps employment status as the mere presence of
+// EmployeeDetail.TerminationDate (NULL = employed) with the reason in
+// EmployeeDetail.TerminationReason → luTerminationReason, and — separately,
+// and never kept in sync by HRIS itself — the HRIS login as UserProfile.Status
+// (1 enabled, 0 disabled). When an exit clearance completes, the portal writes
+// all three so the master data stops lagging the real world.
+
+// The reason codes HRIS knows, for the settings screen.
+const getTerminationReasons = async () => {
+    try {
+        await sql.connect(dbConfig);
+        const request = new sql.Request();
+        const result = await request.query('SELECT Id, Reason FROM dbo.luTerminationReason ORDER BY Id');
+        return result.recordset || [];
+    } catch (e) {
+        console.error("Error fetching termination reasons:", e.message);
+        return [];
+    } finally {
+        await sql.close();
+    }
+};
+
+// What HRIS currently says about this employee's termination and login.
+const getEmployeeTermination = async (username, employeeId) => {
+    try {
+        await sql.connect(dbConfig);
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) return null;
+        const request = new sql.Request();
+        request.input('userId', sql.Int, userId);
+        const result = await request.query(`
+            SELECT d.UserId, d.EmployeeId,
+                   LTRIM(RTRIM(d.[Name])) + ' ' + LTRIM(RTRIM(d.[FName])) + ' ' + LTRIM(RTRIM(d.[GFName])) AS FullName,
+                   d.TerminationDate, d.TerminationReason,
+                   tr.Reason,
+                   u.Status AS LoginStatus, u.UserName
+            FROM dbo.EmployeeDetail d
+            LEFT JOIN dbo.UserProfile u ON u.UserId = d.UserId
+            LEFT JOIN dbo.luTerminationReason tr ON tr.Id = d.TerminationReason
+            WHERE d.UserId = @userId
+        `);
+        return result.recordset[0] || null;
+    } catch (e) {
+        console.error("Error fetching employee termination:", e.message);
+        return null;
+    } finally {
+        await sql.close();
+    }
+};
+
+// Disables the HRIS login alone. Used when the release date was still ahead
+// at clearance time: the termination is written then, the login is switched
+// off on the day.
+const disableEmployeeLogin = async (username, employeeId) => {
+    try {
+        await sql.connect(dbConfig);
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) return { ok: false, reason: "not_found" };
+        const r = new sql.Request();
+        r.input('userId', sql.Int, userId);
+        const upd = await r.query('UPDATE dbo.UserProfile SET Status = 0 WHERE UserId = @userId');
+        console.log(`[clearance] HRIS login disabled for UserId=${userId}`);
+        return { ok: true, userId, rows: (upd.rowsAffected && upd.rowsAffected[0]) || 0 };
+    } catch (e) {
+        console.error("Error disabling employee login:", e.message);
+        return { ok: false, reason: "error", message: e.message };
+    } finally {
+        await sql.close();
+    }
+};
+
+// Records the departure in HRIS: TerminationDate, TerminationReason, and
+// (optionally) UserProfile.Status = 0.
+//
+// A termination date already in HRIS that differs from ours is NOT
+// overwritten unless `force` is set — HR may have recorded something
+// deliberately — and the caller is told what was there. The date is sent as
+// the calendar day in East Africa Time: the driver would otherwise ship the
+// UTC instant (21:00 the evening before) and a `date` column would land on the
+// wrong day.
+const setEmployeeTermination = async (username, employeeId, { terminationDate, reasonCode, disableLogin, force } = {}) => {
+    try {
+        await sql.connect(dbConfig);
+        const userId = await _resolveHrisUserId(username, employeeId);
+        if (userId == null) return { ok: false, reason: "not_found" };
+
+        const target = new Date(terminationDate);
+        if (Number.isNaN(target.getTime())) return { ok: false, reason: "bad_date" };
+        const eat = new Date(target.getTime() + 3 * 3600 * 1000);
+        const calendarDay = new Date(Date.UTC(eat.getUTCFullYear(), eat.getUTCMonth(), eat.getUTCDate()));
+        const ymd = calendarDay.toISOString().slice(0, 10);
+
+        const r0 = new sql.Request();
+        r0.input('userId', sql.Int, userId);
+        const cur = (await r0.query('SELECT TerminationDate, TerminationReason FROM dbo.EmployeeDetail WHERE UserId = @userId')).recordset[0];
+        const previous = cur && cur.TerminationDate ? new Date(cur.TerminationDate) : null;
+        const previousYmd = previous ? previous.toISOString().slice(0, 10) : null;
+        if (previous && previousYmd !== ymd && !force) {
+            return { ok: false, reason: "already_set", previous, previous_reason: cur.TerminationReason, userId };
+        }
+
+        const r1 = new sql.Request();
+        r1.input('userId', sql.Int, userId);
+        r1.input('td', sql.Date, calendarDay);
+        if (reasonCode === null || reasonCode === undefined || reasonCode === "") {
+            r1.input('reason', sql.Int, null);
+        } else {
+            r1.input('reason', sql.Int, Number(reasonCode));
+        }
+        const upd = await r1.query('UPDATE dbo.EmployeeDetail SET TerminationDate = @td, TerminationReason = @reason WHERE UserId = @userId');
+
+        let loginDisabled = false;
+        if (disableLogin) {
+            const r2 = new sql.Request();
+            r2.input('userId', sql.Int, userId);
+            await r2.query('UPDATE dbo.UserProfile SET Status = 0 WHERE UserId = @userId');
+            loginDisabled = true;
+        }
+        console.log(`[clearance] HRIS termination written for UserId=${userId}: ${ymd} reason=${reasonCode ?? "NULL"} login_disabled=${loginDisabled}`);
+        return {
+            ok: true,
+            userId,
+            termination_date: calendarDay,
+            previous,
+            rows: (upd.rowsAffected && upd.rowsAffected[0]) || 0,
+            login_disabled: loginDisabled,
+        };
+    } catch (e) {
+        console.error("Error setting employee termination:", e.message);
+        return { ok: false, reason: "error", message: e.message };
+    } finally {
+        await sql.close();
+    }
+};
+
+export { test, guaranteCount, getEmploymentDate, getAmharicNames, updateAmharicNames, getUserPhoto, getPlaceOfAssignment, getEmployeeIdentity, getEmployeeDirectory, getEmployeeEducation, getEmployeeCertifications, getEmployeeAddress, getEmployeeTrainings, getRatingProfile, _sanitizeHris, getTerminationReasons, getEmployeeTermination, setEmployeeTermination, disableEmployeeLogin };

@@ -24,7 +24,17 @@ import ClearanceTemplate from "../../models/rms/ClearanceTemplate.js";
 import ClearanceSettings, { DEFAULT_ROLES, DEFAULT_BENEFITS_ROWS } from "../../models/rms/ClearanceSettings.js";
 import ClearanceCounter from "../../models/rms/ClearanceCounter.js";
 import PushNotificationService from "./pushNotificationService.js";
-import { getEmployeeIdentity } from "./test.js";
+import {
+    getEmployeeIdentity,
+    getEmployeeTermination,
+    setEmployeeTermination,
+    disableEmployeeLogin,
+    test as hrisExperience,
+} from "./test.js";
+import Experinace from "../../models/rms/Experiance_Letter.js";
+import ExperianceCounter from "../../models/rms/ExperianceCounter.js";
+import Guaranty from "../../models/rms/Guaranty_Letter.js";
+import etdate from "ethiopic-date";
 
 export { DEFAULT_ROLES, DEFAULT_BENEFITS_ROWS };
 
@@ -1037,6 +1047,280 @@ export const assignCertificate = async (clearance, by, now = new Date()) => {
 };
 
 // ------------------------------------------------------------------
+// completion: what happens the moment the clearance is Cleared
+// ------------------------------------------------------------------
+//
+// The CEO's line is the last signature, but not the last step. Three things
+// follow, each recorded on the clearance so HR can see they happened and
+// retry any that did not:
+//
+//   hris        — EmployeeDetail.TerminationDate and TerminationReason are
+//                 written, and the HRIS login (UserProfile.Status) disabled,
+//                 so the master data says what the world says. Termination
+//                 in HRIS never disabled logins on its own: 124 of the 138
+//                 people who had left still had one enabled.
+//   guaranties  — every Guaranty letter the employee issued for someone
+//                 else is revoked. A guaranty stands on employment; when the
+//                 employment ends, so does the guaranty, and the public
+//                 verify page must say so.
+//   experience  — an Experience letter is generated, with the position that
+//                 was still open closed on the release date instead of
+//                 reading "to date".
+//
+// Every step is idempotent and independent; a failure in one never blocks
+// another, and never blocks the clearance itself.
+
+export const COMPLETION_STEPS = ["hris", "guaranties", "experience"];
+
+// luTerminationReason codes actually in use, by departure type. HR can change
+// these in Settings; "Other" deliberately writes no reason.
+export const DEFAULT_REASON_CODES = {
+    Resignation: 7, // Resignation Own Accord
+    Retirement: 1016, // Resignation Retirement
+    "Contract End": 1015, // Resignation End of Contract
+    Termination: 1019, // Termination by the bank
+    Death: 1021, // Termination by Death
+    Other: null,
+};
+
+export const completionSettings = (settings) => {
+    const c = (settings && settings.completion) || {};
+    return {
+        hris_write: c.hris_write !== false,
+        hris_disable_login: c.hris_disable_login !== false,
+        revoke_guaranties: c.revoke_guaranties !== false,
+        experience_letter: c.experience_letter !== false,
+        reason_codes: { ...DEFAULT_REASON_CODES, ...((c.reason_codes && typeof c.reason_codes === "object") ? c.reason_codes : {}) },
+    };
+};
+
+export const reasonCodeFor = (settings, terminationType) => {
+    const codes = completionSettings(settings).reason_codes;
+    const v = codes[terminationType];
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+};
+
+// The experience letter's own formatting, copied so the generated letter
+// reads exactly like one approved through the request flow.
+const fmtUS = (d) => new Date(d).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+export const formatLetterName = (name) =>
+    String(name || "")
+        .trim()
+        .toLowerCase()
+        .split(" ")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+
+// One HRIS experience row as a letter line. A position still open in HRIS
+// ends on the release date — the whole reason this letter is generated here
+// rather than through the ordinary request, which would print "to date".
+export const experiencePeriod = (job, releaseDate) => ({
+    period: `From ${fmtUS(job.From)} to ${job.To ? fmtUS(job.To) : fmtUS(releaseDate)}`,
+    position: job.Postion,
+    isCurrent: false,
+});
+
+// The Ethiopic revoke date, in the exact form the Guaranty revoke route
+// stores ("<month> <day> ቀን <year> ዓ.ም").
+export const ethiopicRevokeDate = (nowString) => {
+    const parts = String(nowString || "").split(" ");
+    if (parts.length < 4) return String(nowString || "");
+    return `${parts[1]} ${parts[2].replace("፣", "")} ቀን ${parts[3]} ዓ.ም`;
+};
+
+const escapeRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const stepHris = async (c, settings, { force } = {}) => {
+    const cs = completionSettings(settings);
+    if (!cs.hris_write) return { status: "skipped", message: "HRIS write is turned off in Settings" };
+    const code = reasonCodeFor(settings, c.termination_type);
+    // The termination date is written now — that is the master data. The
+    // login is switched off on the release day, not before it: a clearance
+    // signed a week ahead must not lock someone out while they still work.
+    const releaseDay = startOfDayEAT(c.release_date);
+    const stillEmployed = !!releaseDay && releaseDay.getTime() > Date.now();
+    const disableNow = cs.hris_disable_login && !stillEmployed;
+    const r = await setEmployeeTermination(c.domain_user, c.employee_id, {
+        terminationDate: c.release_date,
+        reasonCode: code,
+        disableLogin: disableNow,
+        force: !!force,
+    });
+    if (!r.ok) {
+        if (r.reason === "already_set") {
+            return {
+                status: "failed",
+                message: `HRIS already has a termination date of ${fmtUS(r.previous)} (reason ${r.previous_reason ?? "none"}). Retry with Force to overwrite it with ${fmtUS(c.release_date)}.`,
+                previous_termination_date: r.previous,
+                previous_reason: r.previous_reason,
+            };
+        }
+        if (r.reason === "not_found") return { status: "failed", message: "Employee not found in HRIS (no EmployeeDetail row)" };
+        if (r.reason === "bad_date") return { status: "failed", message: "The release date is not a valid date" };
+        return { status: "failed", message: r.message || "HRIS write failed" };
+    }
+    let back = null;
+    try {
+        back = await getEmployeeTermination(c.domain_user, c.employee_id);
+    } catch {
+        /* the write succeeded; the read-back is a nicety */
+    }
+    return {
+        status: "done",
+        termination_date: r.termination_date,
+        reason_code: code,
+        reason_name: (back && back.Reason) || "",
+        login_disabled: !!r.login_disabled,
+        login_deferred_until: cs.hris_disable_login && stillEmployed ? releaseDay : null,
+        login_status: back ? back.LoginStatus : undefined,
+        previous_termination_date: r.previous || undefined,
+        message:
+            `TerminationDate set to ${fmtUS(r.termination_date)}` +
+            (code !== null ? `, reason ${code}${back && back.Reason ? ` (${back.Reason})` : ""}` : ", no reason code") +
+            (r.login_disabled ? "; HRIS login disabled" : "") +
+            (cs.hris_disable_login && stillEmployed ? `; HRIS login will be disabled on ${fmtUS(releaseDay)}` : ""),
+    };
+};
+
+const stepGuaranties = async (c, settings) => {
+    const cs = completionSettings(settings);
+    if (!cs.revoke_guaranties) return { status: "skipped", message: "Guaranty revocation is turned off in Settings" };
+    const list = await Guaranty.find({
+        domain_user: { $regex: `^${escapeRx(c.domain_user)}$`, $options: "i" },
+        status: "Viewed",
+    });
+    const already = ((c.completion && c.completion.guaranties && c.completion.guaranties.revoked) || []);
+    if (!list.length) {
+        return { status: "done", revoked: already, message: already.length ? `${already.length} guaranty letter(s) revoked earlier; none still active` : "No active guaranty letters" };
+    }
+    const now = new Date();
+    const am = ethiopicRevokeDate(etdate.now().toString());
+    const revoked = [...already];
+    for (const g of list) {
+        g.status = "Revoked";
+        g.employee_count = 0;
+        g.revoked_date = now;
+        g.revoked_date_amharic = am;
+        // eslint-disable-next-line no-await-in-loop
+        await g.save();
+        revoked.push({
+            _id: g._id,
+            reference_number: g.reference_number || "",
+            guaranty_name: [g.guaranty_first_name, g.guaranty_middle_name, g.guaranty_last_name].filter(Boolean).join(" "),
+            organization: g.guaranty_organazation || "",
+            issued_date: g.viewed_date || null,
+            revoked_at: now,
+        });
+    }
+    return { status: "done", revoked, message: `${list.length} guaranty letter(s) revoked` };
+};
+
+const stepExperience = async (c, settings, by) => {
+    const cs = completionSettings(settings);
+    if (!cs.experience_letter) return { status: "skipped", message: "Experience letter generation is turned off in Settings" };
+    const prior = c.completion && c.completion.experience;
+    if (prior && prior.letter_id) {
+        const existing = await Experinace.findById(prior.letter_id).lean();
+        if (existing) return { ...prior, status: "done", message: `Experience letter ${existing.reference_number} already generated` };
+    }
+    // The other letters store domain_user exactly as the User document has it,
+    // and "My Request" filters on that; match it so the employee finds theirs.
+    const idx = await userIndex();
+    const u = idx.get(lc(c.domain_user));
+    const domainUser = u ? u.user : c.domain_user;
+
+    const hr = await hrisExperience(domainUser);
+    if (!hr || !hr.length) return { status: "failed", message: "No experience rows for this employee in HRIS" };
+    const experiences = hr.map((job) => experiencePeriod(job, c.release_date));
+    const last = hr[hr.length - 1];
+    const reference = await ExperianceCounter.getNextReference();
+    const letter = await Experinace.create({
+        employee_first_name: formatLetterName(hr[0].Name),
+        employee_middle_name: formatLetterName(hr[0].FName),
+        employee_last_name: formatLetterName(hr[0].GFName),
+        domain_user: domainUser,
+        job_grade: String(last.Job_Grade || c.job_title || "—"),
+        salary: last.Salary !== null && last.Salary !== undefined ? String(last.Salary) : "",
+        employee_description: `Generated on completion of exit clearance${c.certificate_number ? ` ${c.certificate_number}` : ""} — release ${fmtUS(c.release_date)}`,
+        employee_count: 1,
+        viewed_by: lc(by),
+        viewed_date: new Date(),
+        status: "Viewed",
+        reference_number: reference,
+        experiences,
+    });
+    return {
+        status: "done",
+        letter_id: letter._id,
+        reference_number: reference,
+        positions: experiences.length,
+        message: `Experience letter ${reference} generated (${experiences.length} position${experiences.length === 1 ? "" : "s"}, last one ending ${fmtUS(c.release_date)})`,
+    };
+};
+
+// Logins whose switch-off waited for the release day. Run by the
+// scheduler; gives up after a dozen failed tries and tells HR.
+export const disableDeferredLogins = async (now = new Date()) => {
+    const due = await Clearance.find({
+        status: "Cleared",
+        "completion.hris.status": "done",
+        "completion.hris.login_deferred_until": { $lte: now },
+    });
+    for (const c of due) {
+        const hris = { ...c.completion.hris };
+        // eslint-disable-next-line no-await-in-loop
+        const r = await disableEmployeeLogin(c.domain_user, c.employee_id);
+        if (r.ok) {
+            hris.login_disabled = true;
+            hris.login_disabled_at = now;
+            hris.login_deferred_until = null;
+            hris.login_disable_error = undefined;
+            hris.message = `${hris.message || ""}; HRIS login disabled ${fmtUS(now)}`;
+        } else {
+            hris.login_disable_attempts = (hris.login_disable_attempts || 0) + 1;
+            hris.login_disable_error = r.message || r.reason || "failed";
+            if (hris.login_disable_attempts >= 12) {
+                hris.login_deferred_until = null;
+                // eslint-disable-next-line no-await-in-loop
+                await notifyAdmins(
+                    payload("HRIS login could not be disabled", `${c.employee_name} — ${hris.login_disable_error}`, "/admin/clearance/list", "clearance_completion")
+                );
+            }
+        }
+        c.completion = { ...c.completion, hris };
+        c.markModified("completion");
+        // eslint-disable-next-line no-await-in-loop
+        await c.save();
+    }
+    return due.length;
+};
+
+// Runs every step (or one), records each outcome on the clearance, saves.
+export const runCompletion = async (c, by, settings, { only, force } = {}) => {
+    const now = new Date();
+    c.completion = c.completion && typeof c.completion === "object" ? { ...c.completion } : {};
+    const steps = only && COMPLETION_STEPS.includes(only) ? [only] : COMPLETION_STEPS;
+    for (const step of steps) {
+        let result;
+        try {
+            if (step === "hris") result = await stepHris(c, settings, { force });
+            else if (step === "guaranties") result = await stepGuaranties(c, settings);
+            else result = await stepExperience(c, settings, by);
+        } catch (e) {
+            console.error(`[clearance] completion step ${step} failed:`, e);
+            result = { status: "failed", message: (e && e.message) || "failed" };
+        }
+        c.completion[step] = { ...result, at: now, by: lc(by) };
+    }
+    c.completion.ran_at = now;
+    c.markModified("completion");
+    await c.save();
+    return c.completion;
+};
+
+// ------------------------------------------------------------------
 // seed
 // ------------------------------------------------------------------
 
@@ -1236,6 +1520,9 @@ export const tick = async () => {
                 }
             }
         }
+
+        // 3. HRIS logins whose switch-off waited for the release day.
+        await disableDeferredLogins(now);
     } catch (e) {
         console.error("[clearance] scheduler tick failed:", e);
     } finally {

@@ -34,6 +34,16 @@ export const DEFAULT_BENEFITS_ROWS = [
     { code: "notice_deduction", label: "Notice Period Deduction", filled_by: "hr", system_source: "" },
 ];
 
+// luTerminationReason codes in use, by departure type. "Other" writes none.
+export const DEFAULT_REASON_CODES = {
+    Resignation: 7,
+    Retirement: 1016,
+    "Contract End": 1015,
+    Termination: 1019,
+    Death: 1021,
+    Other: null,
+};
+
 // The branch that holds the accounts of head-office staff, so their loan and
 // provident rows have a branch manager to fill them. Looked up by code once,
 // when no branch has been chosen yet.
@@ -96,6 +106,16 @@ const clearanceSettingsSchema = new Schema(
         // Branch whose manager fills the branch rows for head-office employees.
         service_branch_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit" },
 
+        // What runs when a clearance is Cleared, and which luTerminationReason
+        // code each departure type writes to HRIS.
+        completion: {
+            hris_write: { type: Boolean, default: true },
+            hris_disable_login: { type: Boolean, default: true },
+            revoke_guaranties: { type: Boolean, default: true },
+            experience_letter: { type: Boolean, default: true },
+            reason_codes: { type: Schema.Types.Mixed, default: () => ({ ...DEFAULT_REASON_CODES }) },
+        },
+
         updated_by: { type: String, trim: true },
     },
     { timestamps: true }
@@ -112,6 +132,16 @@ clearanceSettingsSchema.statics.get = async function () {
     }
     if (!doc.benefits_rows || !doc.benefits_rows.length) {
         doc.benefits_rows = DEFAULT_BENEFITS_ROWS.map((r) => ({ ...r }));
+        dirty = true;
+    }
+    if (!doc.completion || doc.completion.hris_write === undefined) {
+        doc.completion = {
+            hris_write: true,
+            hris_disable_login: true,
+            revoke_guaranties: true,
+            experience_letter: true,
+            reason_codes: { ...DEFAULT_REASON_CODES },
+        };
         dirty = true;
     }
     if (!doc.service_branch_id && mongoose.models.ClearanceUnit) {

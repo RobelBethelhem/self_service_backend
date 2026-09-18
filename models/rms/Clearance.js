@@ -231,6 +231,10 @@ const clearanceSchema = new Schema(
 
         // ---- completion ----
         certificate_number: { type: String, trim: true },
+        // What followed the last signature: the HRIS write, the guaranty
+        // revocations and the generated experience letter, each with its
+        // outcome. Free-form because each step reports different details.
+        completion: { type: Schema.Types.Mixed },
         cleared_at: { type: Date },
         cleared_by: { type: String, trim: true, lowercase: true },
 

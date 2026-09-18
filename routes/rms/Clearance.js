@@ -61,7 +61,11 @@ import {
     memoUnitLabel,
     memoSuggestedAddressees,
     memoRecipientUsers,
+    COMPLETION_STEPS,
+    runCompletion,
 } from "../../utils/rms/clearanceService.js";
+import { getEmployeeTermination, getTerminationReasons } from "../../utils/rms/test.js";
+import Experinace from "../../models/rms/Experiance_Letter.js";
 
 // Exit clearance — mounted at /zbss/api/clearance.
 //
@@ -809,7 +813,24 @@ router.get("/detail/:id", auth, roleCheck(["user", "admin"]), async (req, res) =
               : { clearance_id: c._id, status: "sent", recipients: me.user };
         const memos = (await ClearanceMemo.find(memoFilter).sort({ createdAt: -1 }).lean()).map(memoSummary);
 
-        return res.json({ clearance: obj, viewer: caps, names, acting, memos, sla_days: settings.sla_days });
+        // The generated experience letter, so the employee or HR can open it
+        // in the ordinary letter view and print it.
+        let experienceLetter = null;
+        const expId = obj.completion && obj.completion.experience && obj.completion.experience.letter_id;
+        if (expId && (caps.is_admin || caps.is_owner)) {
+            experienceLetter = await Experinace.findById(expId).lean();
+        }
+        if (!(caps.is_admin || caps.is_owner)) obj.completion = undefined;
+
+        return res.json({
+            clearance: obj,
+            viewer: caps,
+            names,
+            acting,
+            memos,
+            experience_letter: experienceLetter,
+            sla_days: settings.sla_days,
+        });
     } catch (e) {
         return fail(res, "/detail", e);
     }
@@ -850,8 +871,23 @@ const afterTaskChange = async (res, c, me, org, settings, r, extra = {}) => {
             payload("Your exit clearance is complete", `Certificate ${c.certificate_number}`, "/user/clearance")
         );
         await notifyAdmins(payload("Exit clearance completed", `${c.employee_name} — ${c.certificate_number}`, "/admin/clearance/list"));
+        // The last signature triggers the HRIS write, the guaranty
+        // revocations and the experience letter. Each is recorded on the
+        // clearance and can be retried from the detail page; none may fail
+        // the response that just confirmed the signature.
+        try {
+            await runCompletion(c, me.user, settings);
+            const failed = COMPLETION_STEPS.filter((k) => c.completion && c.completion[k] && c.completion[k].status === "failed");
+            if (failed.length) {
+                await notifyAdmins(
+                    payload("Completion step needs attention", `${c.employee_name} — ${failed.join(", ")} did not complete`, "/admin/clearance/list", "clearance_completion")
+                );
+            }
+        } catch (e) {
+            console.error("[clearance] completion failed:", e);
+        }
     }
-    return res.json({ error: false, clearance: summarize(c), status: c.status });
+    return res.json({ error: false, clearance: summarize(c), status: c.status, completion: c.completion || null });
 };
 
 router.post("/task/act", auth, roleCheck(["user", "admin"]), async (req, res) => {
@@ -1454,6 +1490,50 @@ router.get("/memo/:id", auth, roleCheck(["user", "admin"]), async (req, res) => 
         return res.json({ memo, names });
     } catch (e) {
         return fail(res, "/memo/:id", e);
+    }
+});
+
+// ------------------------------------------------------------------
+// completion: HRIS, guaranties, experience letter
+// ------------------------------------------------------------------
+
+// Re-run one or all of the completion steps on a Cleared clearance. `force`
+// lets the HRIS step overwrite a termination date HR had already recorded.
+router.post("/completion/run", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const { id, step } = req.body || {};
+        const c = await Clearance.findById(id);
+        if (!c) return notFound(res, "Clearance not found");
+        if (c.status !== "Cleared") return conflict(res, `Completion steps run only on a Cleared clearance (this one is ${c.status})`);
+        if (step && !COMPLETION_STEPS.includes(step)) return bad(res, `step must be one of ${COMPLETION_STEPS.join(", ")}`);
+        const settings = await ClearanceSettings.get();
+        const completion = await runCompletion(c, me.user, settings, { only: step, force: !!(req.body && req.body.force) });
+        return res.json({ error: false, completion });
+    } catch (e) {
+        return fail(res, "/completion/run", e);
+    }
+});
+
+// What HRIS currently holds for this employee — to confirm the write landed.
+router.get("/completion/hris/:clearanceId", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const c = await Clearance.findById(req.params.clearanceId).lean();
+        if (!c) return notFound(res, "Clearance not found");
+        const row = await getEmployeeTermination(c.domain_user, c.employee_id);
+        return res.json({ hris: row });
+    } catch (e) {
+        return fail(res, "/completion/hris", e);
+    }
+});
+
+// The termination reason codes HRIS knows, for the Settings screen.
+router.get("/hris/termination-reasons", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        return res.json({ data: await getTerminationReasons() });
+    } catch (e) {
+        return fail(res, "/hris/termination-reasons", e);
     }
 });
 
@@ -2271,6 +2351,30 @@ router.put("/settings", auth, roleCheck(["admin"]), async (req, res) => {
                 rows.push({ code, label, filled_by, system_source });
             }
             s.benefits_rows = rows;
+        }
+        if (b.completion !== undefined && b.completion && typeof b.completion === "object") {
+            const cur = s.completion || {};
+            const next = {
+                hris_write: b.completion.hris_write !== undefined ? !!b.completion.hris_write : cur.hris_write !== false,
+                hris_disable_login: b.completion.hris_disable_login !== undefined ? !!b.completion.hris_disable_login : cur.hris_disable_login !== false,
+                revoke_guaranties: b.completion.revoke_guaranties !== undefined ? !!b.completion.revoke_guaranties : cur.revoke_guaranties !== false,
+                experience_letter: b.completion.experience_letter !== undefined ? !!b.completion.experience_letter : cur.experience_letter !== false,
+                reason_codes: { ...(cur.reason_codes || {}) },
+            };
+            if (b.completion.reason_codes && typeof b.completion.reason_codes === "object") {
+                for (const t of TERMINATION_TYPES) {
+                    if (!(t in b.completion.reason_codes)) continue;
+                    const v = b.completion.reason_codes[t];
+                    if (v === null || v === "" || v === undefined) next.reason_codes[t] = null;
+                    else {
+                        const n = Number(v);
+                        if (!Number.isFinite(n)) return bad(res, `Reason code for ${t} must be a number`);
+                        next.reason_codes[t] = n;
+                    }
+                }
+            }
+            s.completion = next;
+            s.markModified("completion");
         }
         if (b.service_branch_id !== undefined) {
             if (!b.service_branch_id) {
