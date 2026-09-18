@@ -173,6 +173,9 @@ const clearanceSchema = new Schema(
         // Fields HRIS could not supply and which were entered by hand. The
         // approver sees them flagged, as with Medical's place of assignment.
         hris_gaps: { type: [String], default: [] },
+        // "M" / "F" from HRIS, or "" — drives Ato / W/ro and his / her on the
+        // memos HR sends about the departure.
+        gender: { type: String, enum: ["M", "F", ""], default: "" },
 
         // The employee's clearance unit, if they are registered in one.
         unit_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit" },

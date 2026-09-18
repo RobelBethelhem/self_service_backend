@@ -6,6 +6,8 @@ import Clearance, { TERMINATION_TYPES } from "../../models/rms/Clearance.js";
 import ClearanceUnit from "../../models/rms/ClearanceUnit.js";
 import ClearanceUnitMember from "../../models/rms/ClearanceUnitMember.js";
 import ClearanceDelegation from "../../models/rms/ClearanceDelegation.js";
+import ClearanceMemo from "../../models/rms/ClearanceMemo.js";
+import ClearanceMemoPreset from "../../models/rms/ClearanceMemoPreset.js";
 import ClearanceTemplate from "../../models/rms/ClearanceTemplate.js";
 import ClearanceSettings from "../../models/rms/ClearanceSettings.js";
 import {
@@ -52,6 +54,13 @@ import {
     benefitsFillers,
     buildBenefits,
     benefitsComplete,
+    MEMO_KINDS,
+    MEMO_FROM_DEFAULT,
+    memoSubject,
+    memoBodyRuns,
+    memoUnitLabel,
+    memoSuggestedAddressees,
+    memoRecipientUsers,
 } from "../../utils/rms/clearanceService.js";
 
 // Exit clearance — mounted at /zbss/api/clearance.
@@ -712,7 +721,11 @@ router.get("/inbox", auth, roleCheck(["user", "admin"]), async (req, res) => {
             }
         });
 
-        return res.json({ approvals, tasks, manual, benefits, sla_days: settings.sla_days });
+        const memos = (
+            await ClearanceMemo.find({ status: "sent", recipients: me.user }).sort({ sent_at: -1 }).limit(50).lean()
+        ).map(memoSummary);
+
+        return res.json({ approvals, tasks, manual, benefits, memos, sla_days: settings.sla_days });
     } catch (e) {
         return fail(res, "/inbox", e);
     }
@@ -787,7 +800,16 @@ router.get("/detail/:id", auth, roleCheck(["user", "admin"]), async (req, res) =
             names[u] = await displayName(u);
         }
 
-        return res.json({ clearance: obj, viewer: caps, names, acting, sla_days: settings.sla_days });
+        // Memos HR sent about this departure: HR sees all (drafts included);
+        // recipients and the clearance's signatories see what was sent.
+        const memoFilter = me.isAdmin
+            ? { clearance_id: c._id }
+            : caps.is_signer
+              ? { clearance_id: c._id, status: "sent" }
+              : { clearance_id: c._id, status: "sent", recipients: me.user };
+        const memos = (await ClearanceMemo.find(memoFilter).sort({ createdAt: -1 }).lean()).map(memoSummary);
+
+        return res.json({ clearance: obj, viewer: caps, names, acting, memos, sla_days: settings.sla_days });
     } catch (e) {
         return fail(res, "/detail", e);
     }
@@ -1162,6 +1184,276 @@ router.post("/benefits/issue", auth, roleCheck(["admin"]), async (req, res) => {
         return res.json({ error: false, benefits: g.c.benefits });
     } catch (e) {
         return fail(res, "/benefits/issue", e);
+    }
+});
+
+// ------------------------------------------------------------------
+// inter-departmental memos
+// ------------------------------------------------------------------
+
+const cleanAddressees = (list) =>
+    (Array.isArray(list) ? list : [])
+        .map((e) => ({
+            unit_id: e && e.unit_id ? e.unit_id : undefined,
+            label: String((e && e.label) || "").trim().slice(0, 160),
+        }))
+        .filter((e) => e.label);
+
+// Snapshot the parts of the memo that come from the clearance, so what was
+// sent is what is kept even if the record changes afterwards.
+const snapshotMemo = (memo, c) => {
+    memo.body_runs = memoBodyRuns(memo.kind, c);
+    memo.benefits_rows =
+        memo.kind === "outstanding" && c.benefits && c.benefits.rows && c.benefits.rows.length
+            ? c.benefits.rows.map((r) => ({ label: r.label, value: r.value || "" }))
+            : [];
+    memo.employee_name = c.employee_name;
+    memo.domain_user = c.domain_user;
+    memo.markModified("body_runs");
+};
+
+const memoSummary = (m) => ({
+    _id: m._id,
+    kind: m.kind,
+    subject: m.subject,
+    memo_date: m.memo_date,
+    status: m.status,
+    sent_at: m.sent_at || null,
+    sent_by: m.sent_by || "",
+    to_count: (m.to || []).length,
+    cc_count: (m.cc || []).length,
+    clearance_id: m.clearance_id,
+    employee_name: m.employee_name,
+    domain_user: m.domain_user,
+});
+
+// May this caller read this memo? HR always; the units it went to; anyone
+// with a row on the clearance (the departments it concerns).
+const canReadMemo = async (me, memo, now) => {
+    if (me.isAdmin) return true;
+    if (memo.status !== "sent") return false;
+    if ((memo.recipients || []).includes(me.user)) return true;
+    const c = await Clearance.findById(memo.clearance_id).lean();
+    if (!c) return false;
+    const { org, settings } = await ctx();
+    return (c.tasks || []).some((t) => isSigner(org, settings, c, t, me.user, now));
+};
+
+router.get("/memo/presets", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const filter = MEMO_KINDS.includes(req.query.kind) ? { kind: req.query.kind } : {};
+        const data = await ClearanceMemoPreset.find(filter).sort({ kind: 1, is_default: -1, name: 1 }).lean();
+        return res.json({ data });
+    } catch (e) {
+        return fail(res, "/memo/presets", e);
+    }
+});
+
+router.post("/memo/presets", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        const b = req.body || {};
+        if (!MEMO_KINDS.includes(b.kind)) return bad(res, "kind must be resignation or outstanding");
+        const name = String(b.name || "").trim().slice(0, 80);
+        if (!name) return bad(res, "Give the preset a name");
+        const to = cleanAddressees(b.to);
+        if (!to.length) return bad(res, "A preset needs at least one To line");
+        const isDefault = !!b.is_default;
+        if (isDefault) await ClearanceMemoPreset.updateMany({ kind: b.kind, is_default: true }, { $set: { is_default: false } });
+        const preset = await ClearanceMemoPreset.findOneAndUpdate(
+            { kind: b.kind, name },
+            {
+                $set: { to, from_line: String(b.from_line || "").trim().slice(0, 200), cc: cleanAddressees(b.cc), is_default: isDefault, updated_by: me.user },
+                $setOnInsert: { created_by: me.user },
+            },
+            { new: true, upsert: true, setDefaultsOnInsert: true }
+        ).lean();
+        return res.status(201).json({ error: false, preset });
+    } catch (e) {
+        return fail(res, "POST /memo/presets", e);
+    }
+});
+
+router.delete("/memo/presets/:id", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const p = await ClearanceMemoPreset.findByIdAndDelete(req.params.id);
+        if (!p) return notFound(res, "Preset not found");
+        return res.json({ error: false });
+    } catch (e) {
+        return fail(res, "DELETE /memo/presets/:id", e);
+    }
+});
+
+// Everything the composer needs to start: the generated body, a suggested
+// (or default-preset) distribution list, the presets, and the unit registry.
+router.get("/memo/compose/:clearanceId", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const kind = MEMO_KINDS.includes(req.query.kind) ? req.query.kind : "resignation";
+        const c = await Clearance.findById(req.params.clearanceId).lean();
+        if (!c) return notFound(res, "Clearance not found");
+        const now = new Date();
+        const { org } = await ctx();
+        const presets = await ClearanceMemoPreset.find({ kind }).sort({ is_default: -1, name: 1 }).lean();
+        const def = presets.find((p) => p.is_default);
+        const suggested = memoSuggestedAddressees(kind, org, c);
+        return res.json({
+            clearance: summarize(c),
+            kind,
+            defaults: {
+                memo_date: now,
+                subject: memoSubject(kind, c),
+                from_line: def && def.from_line ? def.from_line : MEMO_FROM_DEFAULT,
+                to: def ? def.to : suggested.to,
+                cc: def ? def.cc : suggested.cc,
+                preset_id: def ? def._id : null,
+            },
+            body_runs: memoBodyRuns(kind, c),
+            benefits_rows:
+                kind === "outstanding" && c.benefits && c.benefits.rows
+                    ? c.benefits.rows.map((r) => ({ label: r.label, value: r.value || "" }))
+                    : [],
+            benefits_issued: !!(c.benefits && c.benefits.issued),
+            employee_name: c.employee_name,
+            presets,
+            units: unitsForPicker(org),
+            unit_labels: {
+                departments: org.units.filter((u) => u.kind === "department" && u.active !== false).map((u) => ({ _id: u._id, label: memoUnitLabel(kind, u) })),
+                branches: org.units.filter((u) => u.kind === "branch" && u.active !== false).map((u) => ({ _id: u._id, label: memoUnitLabel(kind, u) })),
+            },
+        });
+    } catch (e) {
+        return fail(res, "/memo/compose", e);
+    }
+});
+
+const applyMemoFields = (memo, b) => {
+    if (b.memo_date !== undefined) {
+        const d = parseDate(b.memo_date);
+        if (d) memo.memo_date = d;
+    }
+    if (b.to !== undefined) memo.to = cleanAddressees(b.to);
+    if (b.cc !== undefined) memo.cc = cleanAddressees(b.cc);
+    if (b.from_line !== undefined) memo.from_line = String(b.from_line || "").trim().slice(0, 200);
+    if (b.subject !== undefined) memo.subject = String(b.subject || "").trim().slice(0, 200);
+};
+
+const sendMemo = async (memo, c, me, org, now) => {
+    snapshotMemo(memo, c);
+    memo.recipients = memoRecipientUsers(org, [...(memo.to || []), ...(memo.cc || [])], now);
+    memo.status = "sent";
+    memo.sent_by = me.user;
+    memo.sent_at = now;
+    memo.updated_by = me.user;
+    await memo.save();
+    await notifyUsers(
+        memo.recipients,
+        payload(
+            `Memo: ${memo.subject}`,
+            `${memo.employee_name} — from ${memo.from_line || "HR"}`,
+            "/clearance/inbox",
+            "clearance_memo"
+        )
+    );
+};
+
+router.post("/memo", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const b = req.body || {};
+        if (!MEMO_KINDS.includes(b.kind)) return bad(res, "kind must be resignation or outstanding");
+        const c = await Clearance.findById(b.clearance_id);
+        if (!c) return notFound(res, "Clearance not found");
+        if (c.status === "Cancelled") return conflict(res, "The clearance is cancelled");
+        const memo = new ClearanceMemo({
+            clearance_id: c._id,
+            kind: b.kind,
+            memo_date: new Date(),
+            subject: memoSubject(b.kind, c),
+            from_line: MEMO_FROM_DEFAULT,
+            created_by: me.user,
+            updated_by: me.user,
+        });
+        applyMemoFields(memo, b);
+        if (!memo.to.length) return bad(res, "Add at least one To line");
+        if (!memo.subject) return bad(res, "The memo needs a subject");
+        snapshotMemo(memo, c);
+        const now = new Date();
+        if (b.send) {
+            const { org } = await ctx();
+            await sendMemo(memo, c, me, org, now);
+        } else {
+            await memo.save();
+        }
+        return res.status(201).json({ error: false, memo: memo.toObject() });
+    } catch (e) {
+        return fail(res, "POST /memo", e);
+    }
+});
+
+router.patch("/memo/:id", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const memo = await ClearanceMemo.findById(req.params.id);
+        if (!memo) return notFound(res, "Memo not found");
+        if (memo.status !== "draft") return conflict(res, "A sent memo cannot be edited — compose a new one");
+        applyMemoFields(memo, req.body || {});
+        if (!memo.to.length) return bad(res, "Add at least one To line");
+        if (!memo.subject) return bad(res, "The memo needs a subject");
+        memo.updated_by = me.user;
+        await memo.save();
+        return res.json({ error: false, memo: memo.toObject() });
+    } catch (e) {
+        return fail(res, "PATCH /memo/:id", e);
+    }
+});
+
+router.post("/memo/:id/send", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const memo = await ClearanceMemo.findById(req.params.id);
+        if (!memo) return notFound(res, "Memo not found");
+        if (memo.status === "sent") return conflict(res, "Already sent");
+        const c = await Clearance.findById(memo.clearance_id);
+        if (!c) return notFound(res, "Clearance not found");
+        const { org } = await ctx();
+        await sendMemo(memo, c, me, org, new Date());
+        return res.json({ error: false, memo: memo.toObject() });
+    } catch (e) {
+        return fail(res, "POST /memo/:id/send", e);
+    }
+});
+
+router.delete("/memo/:id", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const memo = await ClearanceMemo.findById(req.params.id);
+        if (!memo) return notFound(res, "Memo not found");
+        if (memo.status !== "draft") return conflict(res, "Only a draft can be deleted");
+        await memo.deleteOne();
+        return res.json({ error: false });
+    } catch (e) {
+        return fail(res, "DELETE /memo/:id", e);
+    }
+});
+
+router.get("/memo/:id", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const memo = await ClearanceMemo.findById(req.params.id).lean();
+        if (!memo) return notFound(res, "Memo not found");
+        if (!(await canReadMemo(me, memo, new Date()))) return forbidden(res, "This memo was not sent to you");
+        const names = {};
+        for (const u of [memo.sent_by, memo.created_by, ...(memo.recipients || [])]) {
+            if (!u || names[u]) continue;
+            // eslint-disable-next-line no-await-in-loop
+            names[u] = await displayName(u);
+        }
+        return res.json({ memo, names });
+    } catch (e) {
+        return fail(res, "/memo/:id", e);
     }
 });
 

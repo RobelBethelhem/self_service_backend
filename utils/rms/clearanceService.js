@@ -738,7 +738,9 @@ export const snapshotEmployee = async (userDoc) => {
     const date_of_employment = hris && hris.EmploymentDate ? new Date(hris.EmploymentDate) : undefined;
     if (!date_of_employment) gaps.push("date_of_employment");
 
-    return { employee_name, first_name, employee_id, job_title, department, date_of_employment, hris_gaps: gaps };
+    const gender = genderOf(hris && hris.Sex);
+
+    return { employee_name, first_name, employee_id, job_title, department, date_of_employment, gender, hris_gaps: gaps };
 };
 
 // ------------------------------------------------------------------
@@ -802,6 +804,139 @@ export const renderResignationLetter = (c, now = new Date()) => {
         "",
         ...p.signature,
     ].join("\n");
+};
+
+// ------------------------------------------------------------------
+// inter-departmental memos
+// ------------------------------------------------------------------
+
+// HRIS gives Sex as "Male"/"Female" (or M/F). The memos address the employee
+// as Ato / W/ro and refer to "his"/"her"; when HRIS has nothing we fall back
+// to the bare name and "their" rather than guess.
+export const genderOf = (sex) => {
+    const v = lc(sex);
+    if (v.startsWith("m")) return "M";
+    if (v.startsWith("f")) return "F";
+    return "";
+};
+
+export const honorific = (c) => (c.gender === "F" ? "W/ro" : c.gender === "M" ? "Ato" : "");
+
+const pronouns = (c) =>
+    c.gender === "F"
+        ? { his: "her", he: "she", him: "her" }
+        : c.gender === "M"
+          ? { his: "his", he: "he", him: "him" }
+          : { his: "their", he: "they", him: "them" };
+
+export const MEMO_KINDS = ["resignation", "outstanding"];
+export const MEMO_FROM_DEFAULT = "Director- Performance Management & Employee Service Dep't";
+export const MEMO_TITLE_AM = "የውስጥ ለውስጥ ማስታወሻ";
+export const MEMO_TITLE_EN = "INTER-DEPARTMENTAL MEMO";
+
+const addressedName = (c) => [honorific(c), c.employee_name].filter(Boolean).join(" ");
+
+export const memoSubject = (kind, c) => {
+    if (kind === "outstanding") return "Outstanding Loan commitments";
+    return `${c.termination_type === "Resignation" ? "Resignation" : "Departure"} of ${addressedName(c)}`;
+};
+
+// The body, paragraph by paragraph, as runs — the same { t, b } model the
+// salary letter uses, so the screen bolds exactly what the paper memo bolds.
+export const memoBodyRuns = (kind, c) => {
+    const name = addressedName(c);
+    const p = pronouns(c);
+    const date = fmtLongDate(c.release_date);
+    const title = c.job_title || "";
+    const isResign = c.termination_type === "Resignation";
+
+    if (kind === "outstanding") {
+        return [
+            [
+                { t: name, b: true },
+                {
+                    t: `${title ? ` (${title})` : ""} has ${
+                        isResign ? "presented a resignation request to quit" : "been released from"
+                    } ${p.his} employment contract with the Bank effective `,
+                },
+                { t: date, b: true },
+                { t: "." },
+            ],
+            [
+                {
+                    t: `This is therefore, to inform your department of ${p.his} entitlements, outstanding loans (per the attached inter-office memorandum/s) and other outstanding obligations so that you can process settlement of ${p.his} outstanding commitments per the revised HC policy and Procedures:`,
+                },
+            ],
+        ];
+    }
+
+    const unit = c.unit_name || c.department || "";
+    const first = [{ t: "Our permanent employee, " }, { t: name, b: true }];
+    if (title || unit) {
+        first.push({ t: ` (${title}${title && unit ? " at " : ""}` });
+        if (unit) first.push({ t: unit, b: true });
+        first.push({ t: ")" });
+    }
+    first.push(
+        {
+            t: ` has ${
+                isResign
+                    ? "presented a notice to terminate"
+                    : `been released from the Bank's service (${c.termination_type}), ending`
+            } ${p.his} contract of employment with the Bank effective `,
+        },
+        { t: date, b: true },
+        { t: "." }
+    );
+    return [
+        first,
+        [
+            {
+                t: "Thus, all concerned work units are hereby requested to take appropriate clearance actions, including the complete handover of documents and company property.",
+            },
+        ],
+        [
+            {
+                t: "Branch Management Department is also advised to collect any unsettled commitments from branches and communicate to our department within three working days.",
+            },
+        ],
+    ];
+};
+
+// How a unit reads on a memo's To line. The outstanding memo addresses
+// department heads by title ("Director- Credit Portfolio Management Dep't");
+// the resignation memo lists the units themselves; branches are always named.
+export const memoUnitLabel = (kind, unit) =>
+    unit.kind === "department" && kind === "outstanding" ? `Director- ${unit.name}` : unit.name;
+
+// A sensible starting distribution list when HR has no preset yet.
+export const memoSuggestedAddressees = (kind, org, c) => {
+    const active = org.units.filter((u) => u.active !== false);
+    const entry = (u) => ({ unit_id: u._id, label: memoUnitLabel(kind, u) });
+    const employeeBranch =
+        c.unit_kind === "branch" && c.unit_id ? active.find((u) => String(u._id) === String(c.unit_id)) : null;
+    if (kind === "outstanding") {
+        const to = active.filter((u) => u.kind === "department" && ["FIR", "CPM"].includes(String(u.code).toUpperCase())).map(entry);
+        const cc = employeeBranch ? [entry(employeeBranch)] : [];
+        return { to, cc };
+    }
+    const to = active.filter((u) => u.kind === "department").map(entry);
+    if (employeeBranch) to.push(entry(employeeBranch));
+    return { to, cc: [] };
+};
+
+// Who receives a memo: the heads of the units it is addressed or copied to,
+// plus anyone in those units with delegated signing — each replaced by their
+// delegate while one is in force.
+export const memoRecipientUsers = (org, entries, now = new Date()) => {
+    const principals = new Set();
+    (entries || []).forEach((e) => {
+        if (!e || !e.unit_id) return;
+        const unit = org.unitsById.get(String(e.unit_id));
+        if (!unit) return;
+        benefitsFillerPrincipals(org, unit, now).forEach((u) => principals.add(u));
+    });
+    return effectiveActors(org, [...principals], now);
 };
 
 // ------------------------------------------------------------------
