@@ -24,6 +24,9 @@ import SalaryIncrement from "./routes/rms/SalaryIncrement.js"
 import ServiceRating from "./routes/rms/ServiceRating.js"
 import AnnouncementRoutes from "./routes/rms/Announcement.js"
 import HrisReportRoutes from "./routes/rms/HrisReport.js"
+// Exit clearance — independent module; see routes/rms/Clearance.js.
+import ClearanceRoutes from "./routes/rms/Clearance.js"
+import { startScheduler as startClearanceScheduler } from "./utils/rms/clearanceService.js"
 
 
 
@@ -898,6 +901,7 @@ app.use("/zbss/api/users", userRoutes);
   app.use("/zbss/api/service-rating", ServiceRating);
   app.use("/zbss/api/announcement", AnnouncementRoutes);
   app.use("/zbss/api/hris-report", HrisReportRoutes);
+  app.use("/zbss/api/clearance", ClearanceRoutes);
 
  
   
@@ -952,6 +956,8 @@ app.use("/zbss/api/rms/admin/landing",
 const port = process.env.PORT || 8081;
 
 app.listen(port, () => console.log(`Listening on Port ${port}...`));
+// Opens clearances on their release date and sends sign-off reminders.
+startClearanceScheduler();
 
 
 

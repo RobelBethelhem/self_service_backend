@@ -5,6 +5,7 @@ import Embassy    from "../../models/rms/Letter_of_Embassy.js";
 import Guaranty   from "../../models/rms/Guaranty_Letter.js";
 import Supportive from "../../models/rms/Supportive_Letter.js";
 import SalaryIncrementLetter from "../../models/rms/SalaryIncrementLetter.js";
+import Clearance from "../../models/rms/Clearance.js";
 
 const router = Router();
 
@@ -48,7 +49,7 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
       guaranty_organazation: 1,
     };
 
-    const [exp, emb, gua, sup, sib] = await Promise.all([
+    const [exp, emb, gua, sup, sib, clr] = await Promise.all([
       Experiance.findOne({ reference_number: ref }, baseProjection).lean(),
       Embassy.findOne({ reference_number: ref }, baseProjection).lean(),
       Guaranty.findOne({ reference_number: ref }, guarantyProjection).lean(),
@@ -56,7 +57,29 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
       isObjectId(ref)
         ? SalaryIncrementLetter.findById(ref).populate("import_batch_id").lean()
         : Promise.resolve(null),
+      // Exit clearance certificates encode the clearance _id the same way.
+      isObjectId(ref)
+        ? Clearance.findById(ref, {
+            employee_name: 1, status: 1, certificate_number: 1, cleared_at: 1,
+            termination_type: 1, release_date: 1, cancelled: 1,
+          }).lean()
+        : Promise.resolve(null),
     ]);
+
+    // Exit clearance certificate: valid only once the final line is signed.
+    if (clr) {
+      return res.json({
+        valid: clr.status === "Cleared",
+        status: clr.status,
+        letter_type: "Clearance",
+        reference_number: clr.certificate_number || null,
+        employee_name: clr.employee_name || "",
+        issued_date: clr.cleared_at || null,
+        rejected_date: null,
+        revoked_date: clr.status === "Cancelled" && clr.cancelled ? clr.cancelled.at || null : null,
+        termination_type: clr.termination_type,
+      });
+    }
 
     // Salary increment letter: different state machine, different payload mapping.
     if (sib) {
