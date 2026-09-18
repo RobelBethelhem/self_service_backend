@@ -1,7 +1,8 @@
 import mongoose from "mongoose";
 const Schema = mongoose.Schema;
 
-// One person's place inside a ClearanceUnit, registered by that unit's head
+// One person's position in the reporting tree: the unit they belong to, who
+// they report to, and the role they hold — registered by a manager above them
 // (or by HR).
 //
 // Two things are derived from this:
@@ -18,9 +19,14 @@ const clearanceUnitMemberSchema = new Schema(
         unit_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit", required: true, index: true },
         domain_user: { type: String, required: true, trim: true, lowercase: true, index: true },
 
-        role_in_unit: { type: String, enum: ["deputy", "manager", "staff"], default: "staff" },
-        // AD username of this person's own supervisor inside the unit. Empty
-        // means the unit head.
+        // A role label from ClearanceSettings.roles ("Director", "District
+        // Manager", "Branch Manager", "Staff"…). Whether it may register people
+        // beneath it is decided by the settings entry, not here.
+        role_in_unit: { type: String, trim: true, default: "Staff" },
+        // AD username of this person's manager — anywhere in the bank, not
+        // necessarily in the same unit (a branch manager reports to a district
+        // manager who sits in the Branch Management department). Empty means
+        // the unit's head.
         reports_to: { type: String, trim: true, lowercase: true, default: "" },
         can_sign_clearance: { type: Boolean, default: false },
 
@@ -35,6 +41,7 @@ const clearanceUnitMemberSchema = new Schema(
 );
 
 clearanceUnitMemberSchema.index({ unit_id: 1, domain_user: 1 }, { unique: true });
+clearanceUnitMemberSchema.index({ reports_to: 1, active: 1 });
 
 const ClearanceUnitMember = mongoose.model("ClearanceUnitMember", clearanceUnitMemberSchema);
 export default ClearanceUnitMember;

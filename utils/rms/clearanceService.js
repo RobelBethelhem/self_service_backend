@@ -17,7 +17,7 @@ import Clearance from "../../models/rms/Clearance.js";
 import ClearanceUnit from "../../models/rms/ClearanceUnit.js";
 import ClearanceUnitMember from "../../models/rms/ClearanceUnitMember.js";
 import ClearanceTemplate from "../../models/rms/ClearanceTemplate.js";
-import ClearanceSettings from "../../models/rms/ClearanceSettings.js";
+import ClearanceSettings, { DEFAULT_ROLES } from "../../models/rms/ClearanceSettings.js";
 import ClearanceCounter from "../../models/rms/ClearanceCounter.js";
 import PushNotificationService from "./pushNotificationService.js";
 import { getEmployeeIdentity } from "./test.js";
@@ -63,8 +63,46 @@ export const startOfDayEAT = (d) => {
 };
 
 // ------------------------------------------------------------------
-// org: load once per request, then resolve in memory
+// org: the reporting tree, loaded once per request and resolved in memory
 // ------------------------------------------------------------------
+//
+// Every registered person is a NODE: who they report to, the role they hold,
+// and the unit (department or branch) they belong to, inside a validity
+// window. A department's tree starts at its Director; beneath sit district
+// managers, division managers, branch managers and heads, each with people
+// beneath them in turn — Branch Management, for instance, has two district
+// managers whose branch managers each register their own branch staff.
+//
+// Two rules make the tree maintainable without HR typing 2,500 names:
+//   - anyone whose ROLE manages may register people under themselves, and may
+//     edit anyone anywhere beneath them (a Director can fix a branch);
+//   - HR may do anything.
+//
+// The Immediate Supervisor of a person is their node's reports_to. That is the
+// whole reason the tree exists.
+
+export { DEFAULT_ROLES };
+
+const rolesOf = (settings) =>
+    settings && Array.isArray(settings.roles) && settings.roles.length ? settings.roles : DEFAULT_ROLES;
+
+export const roleInfo = (settings, label) => {
+    const hit = rolesOf(settings).find((r) => lc(r.label) === lc(label));
+    if (hit) return hit;
+    // Values from the module's first cut, before roles were configurable.
+    const l = lc(label);
+    if (l === "manager" || l === "deputy") return { label, manages: true, unit_head_for: "" };
+    return { label: label || "", manages: false, unit_head_for: "" };
+};
+
+export const roleManages = (settings, label) => !!roleInfo(settings, label).manages;
+
+// The role that heads a unit of this kind ("Director" for a department,
+// "Branch Manager" for a branch), as configured.
+export const headRoleFor = (settings, kind) => {
+    const r = rolesOf(settings).find((x) => x.unit_head_for === kind);
+    return r ? r.label : kind === "branch" ? "Branch Manager" : "Director";
+};
 
 export const indexOrg = (units, members) => {
     const unitsById = new Map();
@@ -72,6 +110,7 @@ export const indexOrg = (units, members) => {
 
     const membersByUser = new Map();
     const membersByUnit = new Map();
+    const childrenByManager = new Map();
     members.forEach((m) => {
         const u = lc(m.domain_user);
         if (!membersByUser.has(u)) membersByUser.set(u, []);
@@ -79,9 +118,14 @@ export const indexOrg = (units, members) => {
         const k = String(m.unit_id);
         if (!membersByUnit.has(k)) membersByUnit.set(k, []);
         membersByUnit.get(k).push(m);
+        const boss = lc(m.reports_to);
+        if (boss) {
+            if (!childrenByManager.has(boss)) childrenByManager.set(boss, []);
+            childrenByManager.get(boss).push(m);
+        }
     });
 
-    return { units, unitsById, membersByUser, membersByUnit };
+    return { units, unitsById, membersByUser, membersByUnit, childrenByManager };
 };
 
 export const loadOrg = async () => {
@@ -92,9 +136,8 @@ export const loadOrg = async () => {
     return indexOrg(units, members);
 };
 
-// The unit this person currently belongs to, if any. When someone is
-// registered in more than one unit, the most recently valid registration
-// wins.
+// The person's current position: their in-window node and its unit. When a
+// person has more than one active node, the most recently valid one wins.
 export const resolveMembership = (org, user, now = new Date()) => {
     const list = org.membersByUser.get(lc(user)) || [];
     const candidates = list
@@ -115,10 +158,42 @@ const unitHeadIfValid = (unit, now) =>
         ? lc(unit.head_user)
         : "";
 
+export const headsAnyUnit = (org, user, now = new Date()) =>
+    org.units.some(
+        (x) => lc(x.head_user) === lc(user) && x.active !== false && inWindow(x.head_valid_from, x.head_valid_to, now)
+    );
+
+// The people who report directly to `user`. For resolution only in-window
+// nodes count; for editing (includeExpired) an expired subordinate still
+// appears so their dates can be extended.
+export const childrenOf = (org, user, now = new Date(), { includeExpired = false } = {}) =>
+    (org.childrenByManager.get(lc(user)) || [])
+        .filter((m) => m.active !== false && (includeExpired || inWindow(m.valid_from, m.valid_to, now)))
+        .map((m) => ({ member: m, unit: org.unitsById.get(String(m.unit_id)) }));
+
+// Everyone beneath `user`, at any depth. Cycle-safe.
+export const subtreeUsers = (org, user, now = new Date(), opts = {}) => {
+    const out = new Set();
+    const queue = [lc(user)];
+    const seen = new Set(queue);
+    while (queue.length) {
+        const u = queue.shift();
+        for (const { member } of childrenOf(org, u, now, opts)) {
+            const c = lc(member.domain_user);
+            if (!seen.has(c)) {
+                seen.add(c);
+                out.add(c);
+                queue.push(c);
+            }
+        }
+    }
+    return out;
+};
+
 // Who is this person's Immediate Supervisor?
-//   - a registered member: their reports_to, else their unit's head
-//   - a unit head: whoever the unit says the head reports to
-//   - nobody found: "" (HR steps in)
+//   - a registered person: their reports_to, else their unit's head
+//   - a unit head with no node: whoever the unit says the head reports to
+//   - nobody found: "" (HR steps in, and the form says so)
 export const resolveSupervisor = (org, user, now = new Date()) => {
     const u = lc(user);
     const m = resolveMembership(org, u, now);
@@ -132,6 +207,55 @@ export const resolveSupervisor = (org, user, now = new Date()) => {
     );
     if (headed && headed.head_reports_to) return lc(headed.head_reports_to);
     return "";
+};
+
+// The supervisor, their supervisor, and so on up to the top. Cycle-safe.
+export const chainOf = (org, user, now = new Date()) => {
+    const chain = [];
+    let cur = lc(user);
+    const seen = new Set([cur]);
+    for (let i = 0; i < 25; i += 1) {
+        const s = resolveSupervisor(org, cur, now);
+        if (!s || seen.has(s)) break;
+        chain.push(s);
+        seen.add(s);
+        cur = s;
+    }
+    return chain;
+};
+
+// May this person register people beneath themselves? Their role must
+// manage, or they must currently head a unit.
+export const isManagerUser = (org, settings, user, now = new Date()) => {
+    const m = resolveMembership(org, user, now);
+    if (m && roleManages(settings, m.member.role_in_unit)) return true;
+    return headsAnyUnit(org, user, now);
+};
+
+// May `me` edit `target`'s registration? Only if target is somewhere beneath
+// me. (HR is handled by the caller.)
+export const canManageUser = (org, settings, me, target, now = new Date()) =>
+    lc(me) !== lc(target) && subtreeUsers(org, me, now, { includeExpired: true }).has(lc(target));
+
+// May `me` register a person who will report to `manager`? Under myself if I
+// manage; under someone beneath me if THEY manage — the hierarchy the user
+// described, where a district manager registers branch managers who in turn
+// register their staff.
+export const canRegisterUnder = (org, settings, me, manager, now = new Date()) => {
+    const i = lc(me);
+    const m = lc(manager);
+    if (!m) return false;
+    if (m === i) return isManagerUser(org, settings, i, now);
+    return subtreeUsers(org, i, now, { includeExpired: true }).has(m) && isManagerUser(org, settings, m, now);
+};
+
+// Would making `user` report to `newManager` create a loop?
+export const wouldCycle = (org, user, newManager, now = new Date()) => {
+    const u = lc(user);
+    const m = lc(newManager);
+    if (!m) return false;
+    if (m === u) return true;
+    return subtreeUsers(org, u, now, { includeExpired: true }).has(m);
 };
 
 // Everyone currently allowed to sign a task whose rule is `rule`.
@@ -173,6 +297,67 @@ export const resolveSignersForRule = (org, settings, clearance, rule, now = new 
 
 export const isSigner = (org, settings, clearance, task, user, now = new Date()) =>
     resolveSignersForRule(org, settings, clearance, task.signer_rule, now).includes(lc(user));
+
+// A node as the screens show it.
+export const summarizeNode = (org, m, now = new Date()) => {
+    if (!m) return null;
+    const unit = org.unitsById.get(String(m.unit_id));
+    return {
+        _id: m._id,
+        domain_user: lc(m.domain_user),
+        role: m.role_in_unit || "",
+        unit_id: m.unit_id,
+        unit_name: unit ? unit.name : "",
+        unit_code: unit ? unit.code : "",
+        unit_kind: unit ? unit.kind : "",
+        reports_to: lc(m.reports_to),
+        valid_from: m.valid_from,
+        valid_to: m.valid_to,
+        active: m.active !== false,
+        in_window: inWindow(m.valid_from, m.valid_to, now),
+        can_sign_clearance: !!m.can_sign_clearance,
+    };
+};
+
+// The tree beneath `rootUser`, with per-node permissions for `viewer` so the
+// screen never has to guess who may edit what.
+export const buildTree = async (org, settings, rootUser, viewer, now = new Date()) => {
+    const me = lc(viewer.me);
+    const isAdmin = !!viewer.isAdmin;
+    const mySub = isAdmin ? null : subtreeUsers(org, me, now, { includeExpired: true });
+    const idx = await userIndex();
+    const nameOf = (u) => {
+        const x = idx.get(lc(u));
+        return x ? [x.first_name, x.last_name].filter(Boolean).join(" ") : u;
+    };
+
+    const visit = (user, depth, seen) => {
+        const u = lc(user);
+        if (seen.has(u) || depth > 15) return null;
+        seen.add(u);
+        const current = resolveMembership(org, u, now);
+        const anyActive = (org.membersByUser.get(u) || [])
+            .filter((x) => x.active !== false)
+            .sort((a, b) => new Date(b.valid_from || 0) - new Date(a.valid_from || 0))[0];
+        const node = summarizeNode(org, current ? current.member : anyActive, now);
+        return {
+            user: u,
+            name: nameOf(u),
+            node,
+            supervisor: resolveSupervisor(org, u, now),
+            manages: isManagerUser(org, settings, u, now),
+            heads_units: org.units
+                .filter((x) => lc(x.head_user) === u && x.active !== false)
+                .map((x) => ({ _id: x._id, name: x.name, code: x.code, kind: x.kind })),
+            can_edit: isAdmin || (mySub !== null && mySub.has(u)),
+            can_add_under: isAdmin || canRegisterUnder(org, settings, me, u, now),
+            children: childrenOf(org, u, now, { includeExpired: true })
+                .map((k) => visit(k.member.domain_user, depth + 1, seen))
+                .filter(Boolean),
+        };
+    };
+    return visit(rootUser, 0, new Set());
+};
 
 // ------------------------------------------------------------------
 // template → tasks

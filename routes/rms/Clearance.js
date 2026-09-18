@@ -30,6 +30,17 @@ import {
     notifyNewlyPending,
     assignCertificate,
     ensureSeeded,
+    DEFAULT_ROLES,
+    roleInfo,
+    headRoleFor,
+    headsAnyUnit,
+    chainOf,
+    isManagerUser,
+    canManageUser,
+    canRegisterUnder,
+    wouldCycle,
+    summarizeNode,
+    buildTree,
 } from "../../utils/rms/clearanceService.js";
 
 // Exit clearance — mounted at /zbss/api/clearance.
@@ -228,6 +239,8 @@ router.get("/me", auth, roleCheck(["user", "admin"]), async (req, res) => {
             name: me.name,
             is_admin: me.isAdmin,
             heads_units: headsUnits,
+            // Managers who are not unit heads also build a team beneath them.
+            manages: me.isAdmin || isManagerUser(org, settings, me.user, now),
             pending: { approvals, tasks },
         });
     } catch (e) {
@@ -974,7 +987,7 @@ router.post("/open-now", auth, roleCheck(["admin"]), async (req, res) => {
 });
 
 // ------------------------------------------------------------------
-// org: units and members
+// org: units (departments + the branch registry) and the reporting tree
 // ------------------------------------------------------------------
 
 const unitFromBody = (body, out = {}) => {
@@ -1005,6 +1018,61 @@ const decorateUnits = async (units) => {
         });
     }
     return out;
+};
+
+// HR appointing a unit's head is also that head's node in the tree — a
+// Director sits at the top of the department, a Branch Manager at the top of
+// the branch. Kept in step here so the tree never disagrees with the unit.
+const syncHeadNode = async (unit, settings, by) => {
+    const label = headRoleFor(settings, unit.kind);
+    if (unit.head_user) {
+        await ClearanceUnitMember.findOneAndUpdate(
+            { unit_id: unit._id, domain_user: lc(unit.head_user) },
+            {
+                $set: {
+                    role_in_unit: label,
+                    reports_to: lc(unit.head_reports_to),
+                    valid_from: unit.head_valid_from,
+                    valid_to: unit.head_valid_to,
+                    active: unit.active !== false,
+                    can_sign_clearance: true,
+                    updated_by: by,
+                },
+                $setOnInsert: { registered_by: by },
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+    }
+    // A unit has one head: anyone else holding the head role there steps down.
+    await ClearanceUnitMember.updateMany(
+        { unit_id: unit._id, role_in_unit: label, active: true, domain_user: { $ne: lc(unit.head_user) } },
+        { $set: { active: false, updated_by: by } }
+    );
+};
+
+// The other direction: a manager registering a Branch Manager for a branch
+// (or HR registering a Director) makes that person the unit's head.
+const syncUnitHeadFromNode = async (node, settings, by) => {
+    const info = roleInfo(settings, node.role_in_unit);
+    if (!info.unit_head_for) return;
+    const unit = await ClearanceUnit.findById(node.unit_id);
+    if (!unit || unit.kind !== info.unit_head_for) return;
+    if (node.active !== false) {
+        unit.head_user = lc(node.domain_user);
+        unit.head_valid_from = node.valid_from;
+        unit.head_valid_to = node.valid_to;
+        unit.head_reports_to = lc(node.reports_to);
+        unit.updated_by = by;
+        await unit.save();
+        await ClearanceUnitMember.updateMany(
+            { unit_id: unit._id, role_in_unit: node.role_in_unit, active: true, _id: { $ne: node._id } },
+            { $set: { active: false, updated_by: by } }
+        );
+    } else if (lc(unit.head_user) === lc(node.domain_user)) {
+        unit.head_user = "";
+        unit.updated_by = by;
+        await unit.save();
+    }
 };
 
 router.get("/units", auth, roleCheck(["admin"]), async (req, res) => {
@@ -1040,6 +1108,7 @@ router.post("/units", auth, roleCheck(["admin"]), async (req, res) => {
         if (!["branch", "department"].includes(fields.kind)) return bad(res, "kind must be branch or department");
         if (await ClearanceUnit.findOne({ code: fields.code })) return conflict(res, `A unit with code ${fields.code} already exists`);
         const u = await ClearanceUnit.create({ ...fields, created_by: me.user, updated_by: me.user });
+        await syncHeadNode(u, await ClearanceSettings.get(), me.user);
         return res.status(201).json({ error: false, unit: (await decorateUnits([u.toObject()]))[0] });
     } catch (e) {
         return fail(res, "POST /units", e);
@@ -1060,6 +1129,7 @@ router.patch("/units/:id", auth, roleCheck(["admin"]), async (req, res) => {
         if (fields.kind && !["branch", "department"].includes(fields.kind)) return bad(res, "kind must be branch or department");
         Object.assign(u, fields, { updated_by: me.user });
         await u.save();
+        await syncHeadNode(u, await ClearanceSettings.get(), me.user);
         return res.json({ error: false, unit: (await decorateUnits([u.toObject()]))[0] });
     } catch (e) {
         return fail(res, "PATCH /units/:id", e);
@@ -1070,6 +1140,8 @@ router.patch("/units/:id", auth, roleCheck(["admin"]), async (req, res) => {
 const canManageUnit = (me, unit, now = new Date()) =>
     me.isAdmin || (lc(unit.head_user) === me.user && unit.active !== false && inWindow(unit.head_valid_from, unit.head_valid_to, now));
 
+// Everyone registered in a unit, flat. The tree is the better view; this is
+// for a unit that has no head yet.
 router.get("/units/:id/members", auth, roleCheck(["user", "admin"]), async (req, res) => {
     try {
         const me = await whoami(req);
@@ -1077,14 +1149,17 @@ router.get("/units/:id/members", auth, roleCheck(["user", "admin"]), async (req,
         const u = await ClearanceUnit.findById(req.params.id).lean();
         if (!u) return notFound(res, "Unit not found");
         if (!canManageUnit(me, u)) return forbidden(res, "Only the unit head (while appointed) or HR can view members");
-        const members = await ClearanceUnitMember.find({ unit_id: u._id }).sort({ role_in_unit: 1, domain_user: 1 }).lean();
+        const now = new Date();
+        const { org } = await ctx();
+        const members = (org.membersByUnit.get(String(u._id)) || []).sort((a, b) =>
+            String(a.domain_user).localeCompare(String(b.domain_user))
+        );
         const out = [];
         for (const m of members) {
             out.push({
-                ...m,
+                ...summarizeNode(org, m, now),
                 name: await displayName(m.domain_user),
                 reports_to_name: m.reports_to ? await displayName(m.reports_to) : "",
-                in_window: inWindow(m.valid_from, m.valid_to),
             });
         }
         return res.json({ unit: (await decorateUnits([u]))[0], data: out });
@@ -1093,66 +1168,8 @@ router.get("/units/:id/members", auth, roleCheck(["user", "admin"]), async (req,
     }
 });
 
-const memberFromBody = (body, out = {}) => {
-    if (body.role_in_unit !== undefined) out.role_in_unit = body.role_in_unit;
-    if (body.reports_to !== undefined) out.reports_to = lc(body.reports_to);
-    if (body.can_sign_clearance !== undefined) out.can_sign_clearance = !!body.can_sign_clearance;
-    if (body.valid_from !== undefined) out.valid_from = parseDate(body.valid_from) || undefined;
-    if (body.valid_to !== undefined) out.valid_to = parseDate(body.valid_to) || undefined;
-    if (body.active !== undefined) out.active = !!body.active;
-    return out;
-};
-
-router.post("/units/:id/members", auth, roleCheck(["user", "admin"]), async (req, res) => {
-    try {
-        const me = await whoami(req);
-        if (!me) return notFound(res, "User not found");
-        const u = await ClearanceUnit.findById(req.params.id).lean();
-        if (!u) return notFound(res, "Unit not found");
-        if (!canManageUnit(me, u)) return forbidden(res, "Only the unit head (while appointed) or HR can register members");
-
-        const domainUser = lc(req.body && req.body.domain_user);
-        if (!domainUser) return bad(res, "domain_user is required");
-        const idx = await userIndex();
-        if (!idx.get(domainUser)) return notFound(res, `No portal user named "${domainUser}"`);
-        const fields = memberFromBody(req.body || {});
-        if (fields.role_in_unit && !["deputy", "manager", "staff"].includes(fields.role_in_unit)) {
-            return bad(res, "role_in_unit must be deputy, manager or staff");
-        }
-        const m = await ClearanceUnitMember.findOneAndUpdate(
-            { unit_id: u._id, domain_user: domainUser },
-            { $set: { ...fields, active: fields.active !== undefined ? fields.active : true, updated_by: me.user }, $setOnInsert: { registered_by: me.user } },
-            { new: true, upsert: true, setDefaultsOnInsert: true }
-        ).lean();
-        return res.status(201).json({ error: false, member: { ...m, name: await displayName(m.domain_user) } });
-    } catch (e) {
-        return fail(res, "POST /units/:id/members", e);
-    }
-});
-
-router.patch("/units/:id/members/:mid", auth, roleCheck(["user", "admin"]), async (req, res) => {
-    try {
-        const me = await whoami(req);
-        if (!me) return notFound(res, "User not found");
-        const u = await ClearanceUnit.findById(req.params.id).lean();
-        if (!u) return notFound(res, "Unit not found");
-        if (!canManageUnit(me, u)) return forbidden(res, "Only the unit head (while appointed) or HR can edit members");
-        const m = await ClearanceUnitMember.findOne({ _id: req.params.mid, unit_id: u._id });
-        if (!m) return notFound(res, "Member not found");
-        const fields = memberFromBody(req.body || {});
-        if (fields.role_in_unit && !["deputy", "manager", "staff"].includes(fields.role_in_unit)) {
-            return bad(res, "role_in_unit must be deputy, manager or staff");
-        }
-        Object.assign(m, fields, { updated_by: me.user });
-        await m.save();
-        return res.json({ error: false, member: { ...m.toObject(), name: await displayName(m.domain_user) } });
-    } catch (e) {
-        return fail(res, "PATCH /units/:id/members/:mid", e);
-    }
-});
-
-// Lightweight user lookup for pickers. Any signed-in user may search — a unit
-// head needs it to register their staff.
+// Lightweight user lookup for pickers. Any signed-in user may search — a
+// manager needs it to register their staff.
 router.get("/users/search", auth, roleCheck(["user", "admin"]), async (req, res) => {
     try {
         const q = lc(req.query.q);
@@ -1169,6 +1186,221 @@ router.get("/users/search", auth, roleCheck(["user", "admin"]), async (req, res)
         return res.json({ data: out });
     } catch (e) {
         return fail(res, "/users/search", e);
+    }
+});
+
+// ---- the reporting tree ----
+
+const unitsForPicker = (org) => ({
+    departments: org.units
+        .filter((u) => u.kind === "department" && u.active !== false)
+        .map((u) => ({ _id: u._id, name: u.name, code: u.code, kind: u.kind }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    branches: org.units
+        .filter((u) => u.kind === "branch" && u.active !== false)
+        .map((u) => ({ _id: u._id, name: u.name, code: u.code, kind: u.kind }))
+        .sort((a, b) => a.code.localeCompare(b.code)),
+});
+
+const chainWithNames = async (org, settings, user, now) => {
+    const out = [];
+    for (const u of chainOf(org, user, now)) {
+        const m = resolveMembership(org, u, now);
+        out.push({
+            user: u,
+            name: await displayName(u),
+            role: m ? m.member.role_in_unit : headsAnyUnit(org, u, now) ? "Unit head" : "",
+            unit_name: m && m.unit ? m.unit.name : "",
+        });
+    }
+    return out;
+};
+
+// Where I sit, who I report to (all the way up), what I may build beneath me.
+router.get("/org/me", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const now = new Date();
+        const { org, settings } = await ctx();
+        const m = resolveMembership(org, me.user, now);
+        const manages = me.isAdmin || isManagerUser(org, settings, me.user, now);
+        return res.json({
+            me: { user: me.user, name: me.name, is_admin: me.isAdmin, node: summarizeNode(org, m ? m.member : null, now) },
+            supervisor: resolveSupervisor(org, me.user, now),
+            chain: await chainWithNames(org, settings, me.user, now),
+            manages,
+            heads_units: org.units
+                .filter((u) => lc(u.head_user) === me.user && u.active !== false && inWindow(u.head_valid_from, u.head_valid_to, now))
+                .map((u) => ({ _id: u._id, name: u.name, code: u.code, kind: u.kind })),
+            roles: settings.roles && settings.roles.length ? settings.roles : DEFAULT_ROLES,
+            units: unitsForPicker(org),
+            tree: manages ? await buildTree(org, settings, me.user, { me: me.user, isAdmin: me.isAdmin }, now) : null,
+        });
+    } catch (e) {
+        return fail(res, "/org/me", e);
+    }
+});
+
+// The tree beneath any person: HR anyone, otherwise myself or someone beneath me.
+router.get("/org/tree/:user", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const target = lc(req.params.user);
+        const now = new Date();
+        const { org, settings } = await ctx();
+        if (!me.isAdmin && target !== me.user && !canManageUser(org, settings, me.user, target, now)) {
+            return forbidden(res, "You can only view the tree beneath yourself");
+        }
+        return res.json({
+            tree: await buildTree(org, settings, target, { me: me.user, isAdmin: me.isAdmin }, now),
+            chain: await chainWithNames(org, settings, target, now),
+            roles: settings.roles && settings.roles.length ? settings.roles : DEFAULT_ROLES,
+            units: unitsForPicker(org),
+        });
+    } catch (e) {
+        return fail(res, "/org/tree/:user", e);
+    }
+});
+
+// "Who is this person's supervisor?" — the reporting line, top to bottom.
+router.get("/org/chain/:user", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const target = lc(req.params.user);
+        const now = new Date();
+        const { org, settings } = await ctx();
+        if (!me.isAdmin && target !== me.user && !canManageUser(org, settings, me.user, target, now)) {
+            return forbidden(res, "You can only look up people beneath yourself");
+        }
+        const m = resolveMembership(org, target, now);
+        return res.json({
+            user: target,
+            name: await displayName(target),
+            node: summarizeNode(org, m ? m.member : null, now),
+            supervisor: resolveSupervisor(org, target, now),
+            chain: await chainWithNames(org, settings, target, now),
+        });
+    } catch (e) {
+        return fail(res, "/org/chain/:user", e);
+    }
+});
+
+const nodeFromBody = (body, out = {}) => {
+    if (body.role_in_unit !== undefined) out.role_in_unit = String(body.role_in_unit || "").trim();
+    if (body.reports_to !== undefined) out.reports_to = lc(body.reports_to);
+    if (body.unit_id !== undefined) out.unit_id = body.unit_id || undefined;
+    if (body.can_sign_clearance !== undefined) out.can_sign_clearance = !!body.can_sign_clearance;
+    if (body.valid_from !== undefined) out.valid_from = parseDate(body.valid_from) || undefined;
+    if (body.valid_to !== undefined) out.valid_to = parseDate(body.valid_to) || undefined;
+    if (body.active !== undefined) out.active = !!body.active;
+    return out;
+};
+
+// Register a person in the tree (or move them). A person holds one position:
+// registering them elsewhere retires the old one.
+router.post("/org/node", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const body = req.body || {};
+        const domainUser = lc(body.domain_user);
+        if (!domainUser) return bad(res, "domain_user is required");
+        const idx = await userIndex();
+        if (!idx.get(domainUser)) return notFound(res, `No portal user named "${domainUser}"`);
+
+        const fields = nodeFromBody(body);
+        if (!fields.role_in_unit) return bad(res, "Pick a role");
+        if (!fields.unit_id) return bad(res, "Pick the person's unit (department or branch)");
+        const unit = await ClearanceUnit.findById(fields.unit_id).lean();
+        if (!unit || unit.active === false) return notFound(res, "Unit not found");
+        const reportsTo = fields.reports_to || "";
+        if (reportsTo && !idx.get(reportsTo)) return notFound(res, `No portal user named "${reportsTo}"`);
+
+        const now = new Date();
+        const { org, settings } = await ctx();
+        if (!me.isAdmin) {
+            if (!reportsTo) return forbidden(res, "Only HR can register a person with no manager");
+            if (!canRegisterUnder(org, settings, me.user, reportsTo, now)) {
+                return forbidden(res, "You can register people under yourself, or under a manager beneath you");
+            }
+        }
+        if (reportsTo && wouldCycle(org, domainUser, reportsTo, now)) {
+            return bad(res, "That would make the person their own manager (a loop in the reporting line)");
+        }
+
+        // One position per person.
+        await ClearanceUnitMember.updateMany(
+            { domain_user: domainUser, unit_id: { $ne: unit._id }, active: true },
+            { $set: { active: false, updated_by: me.user } }
+        );
+        const node = await ClearanceUnitMember.findOneAndUpdate(
+            { unit_id: unit._id, domain_user: domainUser },
+            {
+                $set: {
+                    ...fields,
+                    unit_id: unit._id,
+                    reports_to: reportsTo,
+                    active: fields.active !== undefined ? fields.active : true,
+                    updated_by: me.user,
+                },
+                $setOnInsert: { registered_by: me.user },
+            },
+            { new: true, upsert: true, setDefaultsOnInsert: true }
+        );
+        await syncUnitHeadFromNode(node, settings, me.user);
+        const fresh = await loadOrg();
+        return res.status(201).json({
+            error: false,
+            node: { ...summarizeNode(fresh, node.toObject(), now), name: await displayName(domainUser) },
+        });
+    } catch (e) {
+        return fail(res, "POST /org/node", e);
+    }
+});
+
+router.patch("/org/node/:id", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const node = await ClearanceUnitMember.findById(req.params.id);
+        if (!node) return notFound(res, "Registration not found");
+        const now = new Date();
+        const { org, settings } = await ctx();
+        if (!me.isAdmin && !canManageUser(org, settings, me.user, node.domain_user, now)) {
+            return forbidden(res, "You can only edit people beneath you");
+        }
+        const fields = nodeFromBody(req.body || {});
+        if (fields.reports_to !== undefined && fields.reports_to !== lc(node.reports_to)) {
+            const idx = await userIndex();
+            if (fields.reports_to && !idx.get(fields.reports_to)) return notFound(res, `No portal user named "${fields.reports_to}"`);
+            if (!me.isAdmin && !canRegisterUnder(org, settings, me.user, fields.reports_to, now)) {
+                return forbidden(res, "You can only move people under yourself or under a manager beneath you");
+            }
+            if (fields.reports_to && wouldCycle(org, node.domain_user, fields.reports_to, now)) {
+                return bad(res, "That would make the person their own manager (a loop in the reporting line)");
+            }
+        }
+        if (fields.unit_id !== undefined && String(fields.unit_id) !== String(node.unit_id)) {
+            const unit = await ClearanceUnit.findById(fields.unit_id).lean();
+            if (!unit || unit.active === false) return notFound(res, "Unit not found");
+            await ClearanceUnitMember.updateMany(
+                { domain_user: node.domain_user, unit_id: { $ne: unit._id }, active: true, _id: { $ne: node._id } },
+                { $set: { active: false, updated_by: me.user } }
+            );
+        }
+        Object.assign(node, fields, { updated_by: me.user });
+        await node.save();
+        await syncUnitHeadFromNode(node, settings, me.user);
+        const fresh = await loadOrg();
+        return res.json({
+            error: false,
+            node: { ...summarizeNode(fresh, node.toObject(), now), name: await displayName(node.domain_user) },
+        });
+    } catch (e) {
+        return fail(res, "PATCH /org/node/:id", e);
     }
 });
 
@@ -1340,6 +1572,27 @@ router.put("/settings", auth, roleCheck(["admin"]), async (req, res) => {
             const n = num(b.escalate_after_days, 1, 90);
             if (n === null) return bad(res, "escalate_after_days must be between 1 and 90");
             s.escalate_after_days = n;
+        }
+        if (b.roles !== undefined) {
+            if (!Array.isArray(b.roles) || !b.roles.length) return bad(res, "At least one role is required");
+            const seen = new Set();
+            const roles = [];
+            for (const r of b.roles) {
+                const label = String((r && r.label) || "").trim();
+                if (!label) return bad(res, "Every role needs a label");
+                const k = label.toLowerCase();
+                if (seen.has(k)) return bad(res, `Role "${label}" is listed twice`);
+                seen.add(k);
+                const uh = ["", "department", "branch"].includes(r.unit_head_for) ? r.unit_head_for : "";
+                roles.push({ label, manages: !!r.manages, unit_head_for: uh });
+            }
+            if (
+                roles.filter((r) => r.unit_head_for === "department").length > 1 ||
+                roles.filter((r) => r.unit_head_for === "branch").length > 1
+            ) {
+                return bad(res, "Only one role can head a department, and only one a branch");
+            }
+            s.roles = roles;
         }
         s.updated_by = me.user;
         await s.save();
