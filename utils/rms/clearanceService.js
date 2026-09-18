@@ -35,6 +35,9 @@ import Experinace from "../../models/rms/Experiance_Letter.js";
 import ExperianceCounter from "../../models/rms/ExperianceCounter.js";
 import Guaranty from "../../models/rms/Guaranty_Letter.js";
 import etdate from "ethiopic-date";
+import GuarantyReleaseNotice from "../../models/rms/GuarantyReleaseNotice.js";
+import GuarantyReleaseCounter from "../../models/rms/GuarantyReleaseCounter.js";
+import { formatEthiopianAm } from "./ethiopianDate.js";
 
 export { DEFAULT_ROLES, DEFAULT_BENEFITS_ROWS };
 
@@ -1319,6 +1322,160 @@ export const runCompletion = async (c, by, settings, { only, force } = {}) => {
     await c.save();
     return c.completion;
 };
+
+// ------------------------------------------------------------------
+// guaranty release notices
+// ------------------------------------------------------------------
+//
+// Every guaranty letter the bank issues promises the receiving company that
+// it will be told if the employee's contract ends ("…ከላይ በተጠቀሰው አድራሻ
+// ለተቋማችሁ የምናሳውቅ መሆኑን…"). Opening the signatories is the moment the
+// departure is settled and dated, so that is when the notice is written —
+// in advance, as the letter promised — one per active guaranty, in the
+// guaranty letter's own format. The revocation itself still happens at
+// final approval. Names come from the guaranty letter, which the employee
+// wrote in Amharic; HRIS may not hold them.
+
+export const RELEASE_NOTICE_SUBJECT = "የሥራ ውል መቋረጥን ማሳወቅን ይመለከታል፡፡";
+
+const joinName = (...parts) =>
+    parts
+        .map((p) => String(p || "").trim())
+        .filter(Boolean)
+        .join(" ");
+
+// The three paragraphs, as bold/plain runs. While the release day is still
+// ahead the letter speaks of a contract that "will end"; afterwards, one
+// that "has ended".
+export const releaseNoticeParagraphs = (f) => {
+    const future = f.tense !== "past";
+    const b = (t) => ({ t, b: true });
+    const p = (t) => ({ t, b: false });
+    return [
+        [
+            p(`የባንካችን ሠራተኛ ${future ? "የሆኑት" : "የነበሩት"} አቶ/ወይ `),
+            b(f.employee_name),
+            p(" ለአቶ/ወይ "),
+            b(f.guaranty_name),
+            p(" ዋስ መሆን ይችሉ ዘንድ የደመወዛቸው መጠንና የባንካችን ቋሚ ሠራተኛ መሆናቸው ተገልጾ፣ "),
+            b(f.original_letter_date_am),
+            p(" በተፃፈ ቁጥር "),
+            b(f.original_reference_number),
+            p(" ደብዳቤ ለተቋማችሁ መረጃ መስጠታችን ይታወሳል፡፡"),
+        ],
+        [
+            p(
+                "በተጠቀሰው ደብዳቤ ላይ ሠራተኛው/ዋ ከባንካችን ጋር ያላቸው የሥራ ውል በማንኛውም ምክንያት ቢቋረጥ ለተቋማችሁ የምናሳውቅ መሆኑን በገባነው ቃል መሠረት፣ አቶ/ወይ "
+            ),
+            b(f.employee_name),
+            p(future ? " ከባንካችን ጋር ያላቸው የሥራ ውል ከ" : " ከባንካችን ጋር የነበራቸው የሥራ ውል ከ"),
+            b(f.release_date_am),
+            p(
+                future
+                    ? " ጀምሮ የሚቋረጥ መሆኑንና ከዚህ ቀን ጀምሮ የባንካችን ሠራተኛ የማይሆኑ መሆናቸውን እናሳውቃለን፡፡"
+                    : " ጀምሮ መቋረጡንና ከዚህ ቀን ጀምሮ የባንካችን ሠራተኛ አለመሆናቸውን እናሳውቃለን፡፡"
+            ),
+        ],
+        [
+            p("በመሆኑም ከላይ በተጠቀሰው ደብዳቤ የተሰጠው መረጃ ከ"),
+            b(f.release_date_am),
+            p(
+                " ጀምሮ ተፈጻሚነት የሌለው መሆኑንና፣ ከዚህ ቀን በኋላ ከተጠቀሰው ዋስትና ጋር በተያያዘ ለሚነሳ ማንኛውም ጥያቄ ባንካችን ኃላፊነት የማይወስድ መሆኑን እየገለጽን፣ ተቋማችሁ ይህንኑ ተገንዝቦ አስፈላጊውን እርምጃ እንዲወስድ በአክብሮት እንጠይቃለን፡፡"
+            ),
+        ],
+    ];
+};
+
+// Everything a notice prints, taken from the guaranty letter and the
+// clearance. Pure, so the wording can be tested.
+export const noticeFieldsFor = (g, c, now = new Date()) => {
+    const releaseDay = startOfDayEAT(c.release_date);
+    const today = startOfDayEAT(now);
+    const tense = releaseDay && today && releaseDay.getTime() < today.getTime() ? "past" : "future";
+    const f = {
+        clearance_id: c._id,
+        guaranty_id: g._id,
+        domain_user: lc(c.domain_user),
+        employee_name: joinName(g.employee_first_name, g.employee_middle_name, g.employee_last_name) || c.employee_name || "",
+        guaranty_name: joinName(g.guaranty_first_name, g.guaranty_middle_name, g.guaranty_last_name),
+        organization: String(g.guaranty_organazation || "").trim(),
+        organization_location: String(g.employee_organization_location || "").trim(),
+        organization_city: String(g.guaranty_organazation_cities || "").trim(),
+        original_reference_number: String(g.reference_number || "").trim(),
+        original_letter_date_am: String(g.approved_day_amharic || "").trim() || formatEthiopianAm(g.viewed_date || g.TimeStamp || now),
+        release_date: c.release_date,
+        release_date_am: formatEthiopianAm(c.release_date),
+        letter_date: now,
+        letter_date_am: formatEthiopianAm(now),
+        tense,
+        subject: RELEASE_NOTICE_SUBJECT,
+    };
+    f.paragraphs = releaseNoticeParagraphs(f);
+    return f;
+};
+
+const noticeSummary = (n) => ({
+    _id: n._id,
+    reference_number: n.reference_number,
+    organization: n.organization,
+    organization_city: n.organization_city,
+    guaranty_name: n.guaranty_name,
+    original_reference_number: n.original_reference_number,
+    status: n.status,
+    tense: n.tense,
+});
+
+// Writes a notice for every active guaranty letter that has none yet and
+// records the outcome on the clearance. Safe to run again.
+export const buildReleaseNotices = async (c, by, now = new Date()) => {
+    const record = { at: now, by: lc(by) };
+    try {
+        const active = await Guaranty.find({
+            domain_user: { $regex: `^${escapeRx(c.domain_user)}$`, $options: "i" },
+            status: "Viewed",
+        });
+        const existing = await GuarantyReleaseNotice.find({ clearance_id: c._id }).lean();
+        const have = new Set(existing.map((n) => String(n.guaranty_id)));
+        const made = [];
+        for (const g of active) {
+            if (have.has(String(g._id))) continue;
+            // eslint-disable-next-line no-await-in-loop
+            const dup = await GuarantyReleaseNotice.findOne({ guaranty_id: g._id }).lean();
+            if (dup) continue;
+            const fields = noticeFieldsFor(g, c, now);
+            // eslint-disable-next-line no-await-in-loop
+            fields.reference_number = await GuarantyReleaseCounter.getNextReference();
+            fields.issued_by = lc(by);
+            // eslint-disable-next-line no-await-in-loop
+            made.push(await GuarantyReleaseNotice.create(fields));
+        }
+        const all = [...existing, ...made];
+        record.status = "done";
+        record.count = all.length;
+        record.notices = all.map(noticeSummary);
+        record.message = !all.length
+            ? "No active guaranty letters — no company to notify"
+            : made.length
+              ? `${made.length} release notice${made.length === 1 ? "" : "s"} written${existing.length ? ` (${existing.length} earlier)` : ""}`
+              : `${all.length} release notice${all.length === 1 ? "" : "s"} already written`;
+    } catch (e) {
+        console.error("[clearance] release notices failed:", e);
+        record.status = "failed";
+        record.message = (e && e.message) || "failed";
+    }
+    c.release_notices = record;
+    c.markModified("release_notices");
+    await c.save();
+    return record;
+};
+
+// A cancelled departure voids its notices; the QR on a posted one then says
+// so.
+export const cancelReleaseNotices = async (c, reason, now = new Date()) =>
+    GuarantyReleaseNotice.updateMany(
+        { clearance_id: c._id, status: "Issued" },
+        { status: "Cancelled", cancelled_at: now, cancel_reason: String(reason || "") }
+    );
 
 // ------------------------------------------------------------------
 // seed

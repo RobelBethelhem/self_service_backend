@@ -235,6 +235,9 @@ const clearanceSchema = new Schema(
         // revocations and the generated experience letter, each with its
         // outcome. Free-form because each step reports different details.
         completion: { type: Schema.Types.Mixed },
+        // The release notices written to the companies the employee stood
+        // guarantor for, when the signatories were opened.
+        release_notices: { type: Schema.Types.Mixed },
         cleared_at: { type: Date },
         cleared_by: { type: String, trim: true, lowercase: true },
 

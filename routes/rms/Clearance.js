@@ -63,9 +63,12 @@ import {
     memoRecipientUsers,
     COMPLETION_STEPS,
     runCompletion,
+    buildReleaseNotices,
+    cancelReleaseNotices,
 } from "../../utils/rms/clearanceService.js";
 import { getEmployeeTermination, getTerminationReasons } from "../../utils/rms/test.js";
 import Experinace from "../../models/rms/Experiance_Letter.js";
+import GuarantyReleaseNotice from "../../models/rms/GuarantyReleaseNotice.js";
 
 // Exit clearance — mounted at /zbss/api/clearance.
 //
@@ -822,6 +825,13 @@ router.get("/detail/:id", auth, roleCheck(["user", "admin"]), async (req, res) =
         }
         if (!(caps.is_admin || caps.is_owner)) obj.completion = undefined;
 
+        // The release notices HR posts to the companies the employee stood
+        // guarantor for — HR's to see and print.
+        const releaseNotices = caps.is_admin
+            ? await GuarantyReleaseNotice.find({ clearance_id: c._id }).sort({ createdAt: 1 }).lean()
+            : [];
+        if (!caps.is_admin) obj.release_notices = undefined;
+
         return res.json({
             clearance: obj,
             viewer: caps,
@@ -829,6 +839,7 @@ router.get("/detail/:id", auth, roleCheck(["user", "admin"]), async (req, res) =
             acting,
             memos,
             experience_letter: experienceLetter,
+            release_notices: releaseNotices,
             sla_days: settings.sla_days,
         });
     } catch (e) {
@@ -1538,6 +1549,40 @@ router.get("/hris/termination-reasons", auth, roleCheck(["admin"]), async (req, 
 });
 
 // ------------------------------------------------------------------
+// guaranty release notices
+// ------------------------------------------------------------------
+
+// Write the notices (again) for a clearance whose signatories are open —
+// also for one opened before notices existed, or after a late guaranty.
+router.post("/notices/run", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const c = await Clearance.findById(req.body && req.body.id);
+        if (!c) return notFound(res, "Clearance not found");
+        if (!["Open", "Awaiting Final Approval", "Cleared"].includes(c.status)) {
+            return conflict(res, `Release notices are written once the signatories are open (this clearance is ${c.status})`);
+        }
+        const record = await buildReleaseNotices(c, me.user);
+        const notices = await GuarantyReleaseNotice.find({ clearance_id: c._id }).sort({ createdAt: 1 }).lean();
+        return res.json({ error: false, release_notices: record, notices });
+    } catch (e) {
+        return fail(res, "/notices/run", e);
+    }
+});
+
+// One notice in full, for the letter page.
+router.get("/notice/:id", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const n = await GuarantyReleaseNotice.findById(req.params.id).lean();
+        if (!n) return notFound(res, "Notice not found");
+        return res.json({ notice: n });
+    } catch (e) {
+        return fail(res, "/notice/:id", e);
+    }
+});
+
+// ------------------------------------------------------------------
 // delegations
 // ------------------------------------------------------------------
 
@@ -1698,6 +1743,11 @@ router.post("/cancel", auth, roleCheck(["admin"]), async (req, res) => {
         c.status = "Cancelled";
         c.cancelled = { by: me.user, at: new Date(), reason };
         await c.save();
+        try {
+            await cancelReleaseNotices(c, reason);
+        } catch (e) {
+            console.error("[clearance] cancelling release notices failed:", e);
+        }
         await notifyUsers([c.domain_user], payload("Your exit clearance was cancelled", reason, "/user/clearance"));
         return res.json({ error: false, clearance: summarize(c) });
     } catch (e) {
@@ -1716,7 +1766,16 @@ router.post("/open-now", auth, roleCheck(["admin"]), async (req, res) => {
         if (c.status !== "Approved") return conflict(res, `Only an Approved clearance can be opened (this one is ${c.status})`);
         const { org, settings } = await ctx();
         await openSignatories(c, org, settings, me.user, new Date());
-        return res.json({ error: false, clearance: summarize(c) });
+        // The departure is now settled and dated: tell every company the
+        // employee stood guarantor for, as their guaranty letters promised.
+        // Recorded on the clearance; never allowed to fail the opening.
+        let releaseNotices = null;
+        try {
+            releaseNotices = await buildReleaseNotices(c, me.user);
+        } catch (e) {
+            console.error("[clearance] release notices failed:", e);
+        }
+        return res.json({ error: false, clearance: summarize(c), release_notices: releaseNotices });
     } catch (e) {
         return fail(res, "/open-now", e);
     }

@@ -6,6 +6,7 @@ import Guaranty   from "../../models/rms/Guaranty_Letter.js";
 import Supportive from "../../models/rms/Supportive_Letter.js";
 import SalaryIncrementLetter from "../../models/rms/SalaryIncrementLetter.js";
 import Clearance from "../../models/rms/Clearance.js";
+import GuarantyReleaseNotice from "../../models/rms/GuarantyReleaseNotice.js";
 
 const router = Router();
 
@@ -49,7 +50,7 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
       guaranty_organazation: 1,
     };
 
-    const [exp, emb, gua, sup, sib, clr] = await Promise.all([
+    const [exp, emb, gua, sup, sib, clr, grn] = await Promise.all([
       Experiance.findOne({ reference_number: ref }, baseProjection).lean(),
       Embassy.findOne({ reference_number: ref }, baseProjection).lean(),
       Guaranty.findOne({ reference_number: ref }, guarantyProjection).lean(),
@@ -64,6 +65,8 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
             termination_type: 1, release_date: 1, cancelled: 1,
           }).lean()
         : Promise.resolve(null),
+      // Guaranty release notices carry their own ZB/HC/GRN reference.
+      GuarantyReleaseNotice.findOne({ reference_number: ref }).lean(),
     ]);
 
     // Exit clearance certificate: valid only once the final line is signed.
@@ -101,6 +104,26 @@ router.get(["/verify", "/verify/*"], async (req, res) => {
         revoked_date: sib.revoked_date || null,
         fiscal_year: sib.fiscal_year,
         category: sib.category,
+      });
+    }
+
+    // Guaranty release notice: the letter telling a company that the
+    // employee who stood guarantor for one of its people has left the bank.
+    // Valid while Issued; Cancelled if the departure was called off.
+    if (grn) {
+      return res.json({
+        valid: grn.status === "Issued",
+        status: grn.status,
+        letter_type: "GuarantyReleaseNotice",
+        reference_number: grn.reference_number,
+        employee_name: grn.employee_name || "",
+        issued_date: grn.letter_date || grn.createdAt || null,
+        rejected_date: null,
+        revoked_date: grn.status === "Cancelled" ? grn.cancelled_at || null : null,
+        guarantor_name: grn.guaranty_name || undefined,
+        guarantor_organization: grn.organization || undefined,
+        original_reference_number: grn.original_reference_number || undefined,
+        release_date: grn.release_date || null,
       });
     }
 
