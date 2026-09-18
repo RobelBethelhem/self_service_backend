@@ -13,6 +13,42 @@ export const DEFAULT_ROLES = [
     { label: "Staff", manages: false, unit_head_for: "" },
 ];
 
+// The "List of Benefits" statement, as HR's paper version has it. Two dates
+// come from the record; the loan and provident rows are the branch's to fill
+// (the employee's own branch, or the service branch for head-office staff);
+// the rest are HR's. Who fills what is HR's to change.
+export const DEFAULT_BENEFITS_ROWS = [
+    { code: "date_of_employment", label: "Date of Employment", filled_by: "system", system_source: "date_of_employment" },
+    { code: "date_of_resignation", label: "Date of Resignation", filled_by: "system", system_source: "release_date" },
+    { code: "accrued_leave", label: "Accrued Annual Leave as of resignation date", filled_by: "hr", system_source: "" },
+    { code: "severance", label: "Severance Payment", filled_by: "hr", system_source: "" },
+    { code: "provident_fund", label: "Provident Fund", filled_by: "branch", system_source: "" },
+    { code: "emergency_loan", label: "Emergency Staff Loan", filled_by: "branch", system_source: "" },
+    { code: "personal_loan", label: "Personal Staff Loan", filled_by: "branch", system_source: "" },
+    { code: "automobile_loan", label: "Automobile Loan", filled_by: "branch", system_source: "" },
+    { code: "housing_loan", label: "Housing Loan", filled_by: "branch", system_source: "" },
+    { code: "business_car_loan", label: "Business Car Loan", filled_by: "branch", system_source: "" },
+    { code: "training_commitment", label: "Training Commitment", filled_by: "hr", system_source: "" },
+    { code: "bonus_commitment", label: "Bonus Commitment", filled_by: "hr", system_source: "" },
+    { code: "share_commitment", label: "Share Commitment", filled_by: "hr", system_source: "" },
+    { code: "notice_deduction", label: "Notice Period Deduction", filled_by: "hr", system_source: "" },
+];
+
+// The branch that holds the accounts of head-office staff, so their loan and
+// provident rows have a branch manager to fill them. Looked up by code once,
+// when no branch has been chosen yet.
+export const DEFAULT_SERVICE_BRANCH_CODE = "164";
+
+const benefitsRowSchema = new Schema(
+    {
+        code: { type: String, required: true, trim: true },
+        label: { type: String, required: true, trim: true },
+        filled_by: { type: String, enum: ["system", "branch", "hr"], default: "hr" },
+        system_source: { type: String, enum: ["", "date_of_employment", "release_date"], default: "" },
+    },
+    { _id: false }
+);
+
 // Module-wide settings for exit clearance. A single document, keyed "default".
 //
 // The CEO delegate window is how "the President is away" is expressed: while
@@ -52,6 +88,14 @@ const clearanceSettingsSchema = new Schema(
             default: () => DEFAULT_ROLES.map((r) => ({ ...r })),
         },
 
+        // The benefits statement's rows and who fills each.
+        benefits_rows: {
+            type: [benefitsRowSchema],
+            default: () => DEFAULT_BENEFITS_ROWS.map((r) => ({ ...r })),
+        },
+        // Branch whose manager fills the branch rows for head-office employees.
+        service_branch_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit" },
+
         updated_by: { type: String, trim: true },
     },
     { timestamps: true }
@@ -60,11 +104,28 @@ const clearanceSettingsSchema = new Schema(
 clearanceSettingsSchema.statics.get = async function () {
     let doc = await this.findOne({ key: "default" });
     if (!doc) doc = await this.create({ key: "default" });
-    // A settings document from before roles existed gets the defaults.
+    let dirty = false;
+    // A settings document from before these fields existed gets the defaults.
     if (!doc.roles || !doc.roles.length) {
         doc.roles = DEFAULT_ROLES.map((r) => ({ ...r }));
-        await doc.save();
+        dirty = true;
     }
+    if (!doc.benefits_rows || !doc.benefits_rows.length) {
+        doc.benefits_rows = DEFAULT_BENEFITS_ROWS.map((r) => ({ ...r }));
+        dirty = true;
+    }
+    if (!doc.service_branch_id && mongoose.models.ClearanceUnit) {
+        const branch = await mongoose.models.ClearanceUnit.findOne({
+            kind: "branch",
+            active: true,
+            code: { $regex: `^0*${DEFAULT_SERVICE_BRANCH_CODE}$` },
+        }).lean();
+        if (branch) {
+            doc.service_branch_id = branch._id;
+            dirty = true;
+        }
+    }
+    if (dirty) await doc.save();
     return doc;
 };
 

@@ -5,6 +5,7 @@ import User from "../../models/rms/User.js";
 import Clearance, { TERMINATION_TYPES } from "../../models/rms/Clearance.js";
 import ClearanceUnit from "../../models/rms/ClearanceUnit.js";
 import ClearanceUnitMember from "../../models/rms/ClearanceUnitMember.js";
+import ClearanceDelegation from "../../models/rms/ClearanceDelegation.js";
 import ClearanceTemplate from "../../models/rms/ClearanceTemplate.js";
 import ClearanceSettings from "../../models/rms/ClearanceSettings.js";
 import {
@@ -14,6 +15,7 @@ import {
     loadOrg,
     resolveMembership,
     resolveSupervisor,
+    resolveSignerPrincipals,
     resolveSignersForRule,
     isSigner,
     recompute,
@@ -22,6 +24,7 @@ import {
     viewerCapabilities,
     snapshotEmployee,
     renderResignationLetter,
+    renderResignationLetterParts,
     userIndex,
     displayName,
     payload,
@@ -41,16 +44,24 @@ import {
     wouldCycle,
     summarizeNode,
     buildTree,
+    actingFor,
+    principalsOf,
+    effectiveActors,
+    actingMap,
+    benefitsBranchUnit,
+    benefitsFillers,
+    buildBenefits,
+    benefitsComplete,
 } from "../../utils/rms/clearanceService.js";
 
 // Exit clearance — mounted at /zbss/api/clearance.
 //
 // Two audiences use these routes with two different kinds of authority:
 //   - the existing global roles: `user` (any employee) and `admin` (HR);
-//   - clearance-specific authority resolved LIVE from the unit hierarchy:
-//     "is this caller the employee's supervisor?", "may this caller sign this
-//     row?". Those checks are never taken from a stored list — see
-//     clearanceService for why.
+//   - clearance-specific authority resolved LIVE from the unit hierarchy and
+//     the delegations in force today: "is this caller the employee's
+//     supervisor, or standing in for them?", "may this caller sign this row?".
+//     Those checks are never taken from a stored list — see clearanceService.
 
 const router = Router();
 
@@ -119,26 +130,51 @@ const applyMembership = (org, c, now) => {
     }
 };
 
-// Opens the form now and sends the first wave of notifications.
-const openNow = async (c, org, settings, now = new Date()) => {
-    // A fresh database has no template yet; seed the paper form rather than fail.
+// HR opens the signatories: snapshot the form and the benefits statement,
+// then tell everyone whose turn it now is.
+const openSignatories = async (c, org, settings, by, now = new Date()) => {
     await ensureSeeded("system");
     const template = await ClearanceTemplate.findOne({ active: true }).lean();
     if (!template) throw new Error("No active clearance template");
     const r = openClearance(c, template, now);
+    c.opened_by = lc(by);
+    c.benefits = buildBenefits(settings, c, benefitsBranchUnit(org, settings, c));
     refreshSnapshots(org, settings, c, now);
     await c.save();
+
     await notifyNewlyPending(org, settings, c, r.newlyPending);
     await notifyUsers(
         [c.domain_user],
         payload("Your exit clearance is open", "Departments have been notified to sign.", "/user/clearance")
     );
+    const fillers = benefitsFillers(org, settings, c, now);
+    if (fillers.length) {
+        await notifyUsers(
+            fillers,
+            payload(
+                "Benefits statement to fill",
+                `${c.employee_name} — the branch rows are yours to complete`,
+                "/clearance/inbox",
+                "clearance_benefits"
+            )
+        );
+    } else {
+        await notifyAdmins(
+            payload(
+                "No branch to fill the benefits statement",
+                `${c.employee_name} — no branch manager resolved; HR may fill the branch rows`,
+                "/admin/clearance/list",
+                "clearance_benefits"
+            )
+        );
+    }
     return r;
 };
 
 // Summary a list row or inbox item needs — never the whole document.
 const summarize = (c) => {
     const tasks = c.tasks || [];
+    const b = c.benefits || {};
     return {
         _id: c._id,
         domain_user: c.domain_user,
@@ -161,6 +197,14 @@ const summarize = (c) => {
         cleared_at: c.cleared_at,
         certificate_number: c.certificate_number,
         createdAt: c.createdAt,
+        benefits_meta: {
+            exists: !!(b.rows && b.rows.length),
+            branch_unit_name: b.branch_unit_name || "",
+            branch_unit_code: b.branch_unit_code || "",
+            branch_submitted_at: b.branch_submitted_at || null,
+            issued: !!b.issued,
+            issued_at: b.issued_at || null,
+        },
         counts: {
             total: tasks.filter((t) => !t.auto).length,
             cleared: tasks.filter((t) => t.status === "Cleared").length,
@@ -195,6 +239,16 @@ const parseDeparture = (body, { requireReason }) => {
     return { ok: true, fields: { immediate, reason, additional_statement, release_date } };
 };
 
+// Whether the caller may act as this clearance's supervisor today: the
+// supervisor themselves, or whoever is standing in for them.
+const supervisorActor = (org, c, me, now) => {
+    const principal = lc(c.supervisor_user);
+    if (!principal) return { allowed: false, actingFor: "" };
+    const allowed = effectiveActors(org, [principal], now);
+    if (!allowed.includes(me)) return { allowed: false, actingFor: "" };
+    return { allowed: true, actingFor: me === principal ? "" : principal };
+};
+
 // ------------------------------------------------------------------
 // GET /me — what the sidebar and inbox need to know about the caller
 // ------------------------------------------------------------------
@@ -209,20 +263,19 @@ router.get("/me", auth, roleCheck(["user", "admin"]), async (req, res) => {
             .filter((u) => lc(u.head_user) === me.user && inWindow(u.head_valid_from, u.head_valid_to, now))
             .map((u) => ({ _id: u._id, name: u.name, code: u.code, kind: u.kind }));
 
-        // Pending counts, computed the same way /inbox does.
-        let approvals = await Clearance.countDocuments({
-            status: "Pending Supervisor",
-            supervisor_user: me.user,
-        });
+        const pendingSup = await Clearance.find({ status: "Pending Supervisor" }, { supervisor_user: 1, supervisor_unresolved: 1 }).lean();
+        let approvals = pendingSup.filter((c) => supervisorActor(org, c, me.user, now).allowed).length;
         if (me.isAdmin) {
             approvals += await Clearance.countDocuments({ status: "Pending HR" });
-            approvals += await Clearance.countDocuments({ status: "Pending Supervisor", supervisor_unresolved: true });
+            approvals += pendingSup.filter((c) => c.supervisor_unresolved).length;
         }
+
         const open = await Clearance.find(
-            { status: { $in: ["Open", "Awaiting Final Approval"] }, "tasks.status": { $in: ["Pending", "Outstanding"] } },
-            { tasks: 1, domain_user: 1, supervisor_user: 1 }
+            { status: { $in: ["Open", "Awaiting Final Approval"] } },
+            { tasks: 1, domain_user: 1, supervisor_user: 1, benefits: 1, unit_kind: 1, unit_id: 1 }
         ).lean();
         let tasks = 0;
+        let benefits = 0;
         open.forEach((c) => {
             (c.tasks || []).forEach((t) => {
                 if (t.status !== "Pending" && t.status !== "Outstanding") return;
@@ -232,6 +285,12 @@ router.get("/me", auth, roleCheck(["user", "admin"]), async (req, res) => {
                     tasks += 1;
                 }
             });
+            const b = c.benefits;
+            if (b && b.rows && b.rows.length && !b.issued) {
+                const fillers = benefitsFillers(org, settings, c, now);
+                if (!b.branch_submitted_at && fillers.includes(me.user)) benefits += 1;
+                else if (me.isAdmin && (b.branch_submitted_at || !fillers.length)) benefits += 1;
+            }
         });
 
         return res.json({
@@ -239,9 +298,9 @@ router.get("/me", auth, roleCheck(["user", "admin"]), async (req, res) => {
             name: me.name,
             is_admin: me.isAdmin,
             heads_units: headsUnits,
-            // Managers who are not unit heads also build a team beneath them.
             manages: me.isAdmin || isManagerUser(org, settings, me.user, now),
-            pending: { approvals, tasks },
+            acting_for: principalsOf(org, me.user, now),
+            pending: { approvals, tasks, benefits },
         });
     } catch (e) {
         return fail(res, "/me", e);
@@ -261,7 +320,12 @@ router.post("/resign/preview", auth, roleCheck(["user", "admin"]), async (req, r
         if (!parsed.ok) return bad(res, parsed.message);
         const snap = await snapshotEmployee(me.doc);
         const draft = { ...snap, domain_user: me.user, ...parsed.fields };
-        return res.json({ letter: renderResignationLetter(draft), snapshot: snap, release_date: parsed.fields.release_date });
+        return res.json({
+            letter: renderResignationLetter(draft),
+            parts: renderResignationLetterParts(draft),
+            snapshot: snap,
+            release_date: parsed.fields.release_date,
+        });
     } catch (e) {
         return fail(res, "/resign/preview", e);
     }
@@ -301,13 +365,17 @@ router.post("/resign", auth, roleCheck(["user", "admin"]), async (req, res) => {
         c.supervisor_unresolved = !supervisor;
         c.status = supervisor ? "Pending Supervisor" : "Pending HR";
         c.resignation_letter = renderResignationLetter(c, now);
+        c.resignation_letter_parts = renderResignationLetterParts(c, now);
         await c.save();
 
         const body = `${c.employee_name} has submitted a resignation (release ${
             c.immediate ? "immediately" : c.release_date.toDateString()
         }).`;
         if (supervisor) {
-            await notifyUsers([supervisor], payload("Resignation awaiting your approval", body, "/clearance/inbox"));
+            await notifyUsers(
+                effectiveActors(org, [supervisor], now),
+                payload("Resignation awaiting your approval", body, "/clearance/inbox")
+            );
         } else {
             await notifyAdmins(
                 payload("Resignation awaiting HR (no supervisor mapped)", body, "/admin/clearance/list")
@@ -344,11 +412,15 @@ router.post("/resign/resubmit", auth, roleCheck(["user", "admin"]), async (req, 
         c.supervisor_unresolved = !supervisor;
         c.status = supervisor ? "Pending Supervisor" : "Pending HR";
         c.resignation_letter = renderResignationLetter(c, now);
+        c.resignation_letter_parts = renderResignationLetterParts(c, now);
         await c.save();
 
         const body = `${c.employee_name} has resubmitted their resignation.`;
-        if (supervisor) await notifyUsers([supervisor], payload("Resignation resubmitted", body, "/clearance/inbox"));
-        else await notifyAdmins(payload("Resignation resubmitted (no supervisor mapped)", body, "/admin/clearance/list"));
+        if (supervisor) {
+            await notifyUsers(effectiveActors(org, [supervisor], now), payload("Resignation resubmitted", body, "/clearance/inbox"));
+        } else {
+            await notifyAdmins(payload("Resignation resubmitted (no supervisor mapped)", body, "/admin/clearance/list"));
+        }
 
         return res.json({ error: false, clearance: summarize(c) });
     } catch (e) {
@@ -356,6 +428,8 @@ router.post("/resign/resubmit", auth, roleCheck(["user", "admin"]), async (req, 
     }
 });
 
+// A resignation can be withdrawn right up until HR opens the signatories —
+// supervisor and HR approval alone do not close the door.
 router.post("/withdraw", auth, roleCheck(["user", "admin"]), async (req, res) => {
     try {
         const me = await whoami(req);
@@ -364,7 +438,7 @@ router.post("/withdraw", auth, roleCheck(["user", "admin"]), async (req, res) =>
         if (!c) return notFound(res, "Clearance not found");
         if (lc(c.domain_user) !== me.user) return forbidden(res, "Only the employee can withdraw");
         if (!["Pending Supervisor", "Pending HR", "Rejected", "Approved"].includes(c.status)) {
-            return conflict(res, "A clearance that is already open cannot be withdrawn — ask HR to cancel it.");
+            return conflict(res, "The signatories are already open — ask HR to cancel the clearance instead.");
         }
         c.status = "Cancelled";
         c.cancelled = { by: me.user, at: new Date(), reason: "Withdrawn by employee" };
@@ -407,11 +481,13 @@ router.post("/decide", auth, roleCheck(["user", "admin"]), async (req, res) => {
         const c = await Clearance.findById(id);
         if (!c) return notFound(res, "Clearance not found");
         const now = new Date();
-        const { org, settings } = await ctx();
+        const { org } = await ctx();
 
         if (c.status === "Pending Supervisor") {
-            const isSup = me.user === lc(c.supervisor_user);
-            if (!isSup && !me.isAdmin) return forbidden(res, "Only the immediate supervisor (or HR) can decide this");
+            const sup = supervisorActor(org, c, me.user, now);
+            if (!sup.allowed && !me.isAdmin) {
+                return forbidden(res, "Only the immediate supervisor (or whoever stands in for them, or HR) can decide this");
+            }
             const rec = {
                 stage: "supervisor",
                 decision,
@@ -419,7 +495,8 @@ router.post("/decide", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 by_name: me.name,
                 at: now,
                 reason,
-                on_behalf: !isSup,
+                on_behalf: !sup.allowed,
+                acting_for: sup.actingFor,
             };
             c.supervisor_decision = rec;
             c.decision_history.push(rec);
@@ -431,7 +508,7 @@ router.post("/decide", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 );
                 await notifyUsers(
                     [c.domain_user],
-                    payload("Supervisor approved your resignation", "It is now with HR for final approval.", "/user/clearance")
+                    payload("Supervisor approved your resignation", "It is now with HR for approval.", "/user/clearance")
                 );
             } else {
                 c.status = "Rejected";
@@ -446,32 +523,31 @@ router.post("/decide", auth, roleCheck(["user", "admin"]), async (req, res) => {
 
         if (c.status === "Pending HR") {
             if (!me.isAdmin) return forbidden(res, "Only HR can decide at this stage");
-            const rec = { stage: "hr", decision, by: me.user, by_name: me.name, at: now, reason, on_behalf: false };
+            const rec = { stage: "hr", decision, by: me.user, by_name: me.name, at: now, reason, on_behalf: false, acting_for: "" };
             c.hr_decision = rec;
             c.decision_history.push(rec);
             if (decision === "approve") {
+                // Approval does not open anything: HR opens the signatories
+                // from the Open Signatories page, and until then the employee
+                // may still withdraw.
                 c.status = "Approved";
                 c.approved_at = now;
                 await c.save();
-                if (c.release_date <= now) {
-                    await openNow(c, org, settings, now);
-                } else {
-                    await notifyUsers(
-                        [c.domain_user],
-                        payload(
-                            "HR approved your resignation",
-                            `Your exit clearance will open on ${c.release_date.toDateString()}.`,
-                            "/user/clearance"
-                        )
-                    );
-                }
+                await notifyUsers(
+                    [c.domain_user],
+                    payload(
+                        "HR approved your resignation",
+                        `Release ${c.immediate ? "immediately" : c.release_date.toDateString()}. HR will open the clearance signatories; until then you may still withdraw.`,
+                        "/user/clearance"
+                    )
+                );
             } else {
                 c.status = "Rejected";
                 await c.save();
                 await notifyUsers([c.domain_user], payload("Your resignation was not approved", `HR: ${reason}`, "/user/clearance"));
                 if (c.supervisor_user) {
                     await notifyUsers(
-                        [c.supervisor_user],
+                        effectiveActors(org, [c.supervisor_user], now),
                         payload("HR rejected a resignation you approved", `${c.employee_name}: ${reason}`, "/clearance/inbox")
                     );
                 }
@@ -512,7 +588,7 @@ router.post("/initiate", auth, roleCheck(["admin"]), async (req, res) => {
 
         await ensureSeeded(me.user);
         const now = new Date();
-        const { org, settings } = await ctx();
+        const { org } = await ctx();
         const snap = await snapshotEmployee(targetDoc);
 
         const c = new Clearance({
@@ -529,23 +605,19 @@ router.post("/initiate", auth, roleCheck(["admin"]), async (req, res) => {
         applyMembership(org, c, now);
         c.supervisor_user = resolveSupervisor(org, domainUser, now);
         c.supervisor_unresolved = !c.supervisor_user;
-        const rec = { stage: "hr", decision: "approve", by: me.user, by_name: me.name, at: now, reason: "", on_behalf: false };
+        const rec = { stage: "hr", decision: "approve", by: me.user, by_name: me.name, at: now, reason: "", on_behalf: false, acting_for: "" };
         c.hr_decision = rec;
         c.decision_history.push(rec);
         await c.save();
 
-        if (c.release_date <= now) {
-            await openNow(c, org, settings, now);
-        } else {
-            await notifyUsers(
-                [domainUser],
-                payload(
-                    "An exit clearance has been recorded for you",
-                    `${c.termination_type}. The clearance form opens on ${c.release_date.toDateString()}.`,
-                    "/user/clearance"
-                )
-            );
-        }
+        await notifyUsers(
+            [domainUser],
+            payload(
+                "An exit clearance has been recorded for you",
+                `${c.termination_type}. Release ${c.immediate ? "immediately" : c.release_date.toDateString()}. HR will open the signatories.`,
+                "/user/clearance"
+            )
+        );
         return res.status(201).json({ error: false, clearance: summarize(c) });
     } catch (e) {
         return fail(res, "/initiate", e);
@@ -563,31 +635,30 @@ router.get("/inbox", auth, roleCheck(["user", "admin"]), async (req, res) => {
         const now = new Date();
         const { org, settings } = await ctx();
 
-        const approvalFilter = me.isAdmin
-            ? {
-                  $or: [
-                      { status: "Pending Supervisor", supervisor_user: me.user },
-                      { status: "Pending Supervisor", supervisor_unresolved: true },
-                      { status: "Pending HR" },
-                  ],
-              }
-            : { status: "Pending Supervisor", supervisor_user: me.user };
-        const approvals = (await Clearance.find(approvalFilter).sort({ submitted_at: 1 }).lean()).map((c) => ({
+        const pendingSup = await Clearance.find({ status: "Pending Supervisor" }).sort({ submitted_at: 1 }).lean();
+        const pendingHr = me.isAdmin ? await Clearance.find({ status: "Pending HR" }).sort({ submitted_at: 1 }).lean() : [];
+        const approvals = [
+            ...pendingSup.filter((c) => {
+                const sup = supervisorActor(org, c, me.user, now);
+                return sup.allowed || (me.isAdmin && c.supervisor_unresolved);
+            }),
+            ...pendingHr,
+        ].map((c) => ({
             ...summarize(c),
             stage: c.status === "Pending HR" ? "hr" : "supervisor",
+            acting_for: supervisorActor(org, c, me.user, now).actingFor,
             reason: c.reason,
             resignation_letter: c.resignation_letter,
+            resignation_letter_parts: c.resignation_letter_parts || null,
         }));
 
-        const open = await Clearance.find({
-            status: { $in: ["Open", "Awaiting Final Approval"] },
-            "tasks.status": { $in: ["Pending", "Outstanding"] },
-        })
+        const open = await Clearance.find({ status: { $in: ["Open", "Awaiting Final Approval"] } })
             .sort({ opened_at: 1 })
             .lean();
 
         const tasks = [];
         const manual = [];
+        const benefits = [];
         open.forEach((c) => {
             (c.tasks || []).forEach((t) => {
                 if (t.status !== "Pending" && t.status !== "Outstanding") return;
@@ -615,12 +686,33 @@ router.get("/inbox", auth, roleCheck(["user", "admin"]), async (req, res) => {
                 if (t.signature_mode === "manual") {
                     if (me.isAdmin) manual.push(row);
                 } else if (isSigner(org, settings, c, t, me.user, now)) {
-                    tasks.push(row);
+                    // Which principal the caller acts for on this row, if any.
+                    const principals = resolveSignerPrincipals(org, settings, c, t.signer_rule, now);
+                    const map = actingMap(org, principals, now);
+                    tasks.push({ ...row, acting_for: map[me.user] || "" });
                 }
             });
+            const b = c.benefits;
+            if (b && b.rows && b.rows.length && !b.issued) {
+                const fillers = benefitsFillers(org, settings, c, now);
+                const item = {
+                    clearance_id: c._id,
+                    employee_name: c.employee_name,
+                    domain_user: c.domain_user,
+                    job_title: c.job_title,
+                    release_date: c.release_date,
+                    opened_at: c.opened_at,
+                    branch_unit_name: b.branch_unit_name,
+                    branch_unit_code: b.branch_unit_code,
+                    branch_submitted_at: b.branch_submitted_at || null,
+                };
+                if (!b.branch_submitted_at && fillers.includes(me.user)) benefits.push({ ...item, stage: "branch" });
+                else if (me.isAdmin && b.branch_submitted_at) benefits.push({ ...item, stage: "hr" });
+                else if (me.isAdmin && !fillers.length) benefits.push({ ...item, stage: "branch", note: "no branch manager resolved — HR fills the branch rows" });
+            }
         });
 
-        return res.json({ approvals, tasks, manual, sla_days: settings.sla_days });
+        return res.json({ approvals, tasks, manual, benefits, sla_days: settings.sla_days });
     } catch (e) {
         return fail(res, "/inbox", e);
     }
@@ -642,35 +734,60 @@ router.get("/detail/:id", auth, roleCheck(["user", "admin"]), async (req, res) =
         const caps = viewerCapabilities(org, settings, c, me.user, me.isAdmin, now);
         // Every department sees the whole form (HR's decision), but only
         // people with a part in it — not any employee who guesses an id.
-        if (!(caps.is_admin || caps.is_owner || caps.is_supervisor || caps.is_signer)) {
+        if (!(caps.is_admin || caps.is_owner || caps.is_supervisor || caps.is_signer || caps.benefits.is_filler)) {
             return forbidden(res, "You have no part in this clearance");
         }
 
         refreshSnapshots(org, settings, c, now);
         const obj = c.toObject();
 
-        // Display names for every username that appears on the form.
+        // The benefits statement is the branch's and HR's until it is issued.
+        if (obj.benefits && !caps.benefits.can_view) {
+            obj.benefits = {
+                rows: [],
+                hidden: true,
+                branch_unit_name: obj.benefits.branch_unit_name,
+                branch_unit_code: obj.benefits.branch_unit_code,
+                branch_submitted_at: obj.benefits.branch_submitted_at,
+                issued: obj.benefits.issued,
+                issued_at: obj.benefits.issued_at,
+            };
+        }
+
+        // Display names for every username that appears on the form, and who
+        // is standing in for whom today.
         const names = {};
-        const all = new Set([obj.domain_user, obj.supervisor_user, obj.cleared_by, obj.created_by]);
+        const acting = {};
+        const all = new Set([obj.domain_user, obj.supervisor_user, obj.cleared_by, obj.created_by, obj.opened_by]);
+        if (obj.supervisor_user) Object.assign(acting, actingMap(org, [obj.supervisor_user], now));
         (obj.tasks || []).forEach((t) => {
             (t.signers_snapshot || []).forEach((s) => all.add(s));
+            Object.assign(acting, actingMap(org, resolveSignerPrincipals(org, settings, c, t.signer_rule, now), now));
             if (t.acted_by) all.add(t.acted_by);
+            if (t.acted_for) all.add(t.acted_for);
             if (t.manual && t.manual.verified_by) all.add(t.manual.verified_by);
             (t.history || []).forEach((h) => h.by && all.add(h.by));
         });
-        (obj.decision_history || []).forEach((d) => d.by && all.add(d.by));
+        (obj.decision_history || []).forEach((d) => {
+            if (d.by) all.add(d.by);
+            if (d.acting_for) all.add(d.acting_for);
+        });
+        if (obj.benefits && obj.benefits.rows) {
+            obj.benefits.rows.forEach((r) => r.filled_by_user && r.filled_by_user !== "system" && all.add(r.filled_by_user));
+            [obj.benefits.branch_submitted_by, obj.benefits.hr_submitted_by, obj.benefits.issued_by].forEach((u) => u && all.add(u));
+        }
+        Object.keys(acting).forEach((d) => {
+            all.add(d);
+            all.add(acting[d]);
+        });
+        caps.benefits.fillers.forEach((u) => all.add(u));
         for (const u of all) {
             if (!u) continue;
             // eslint-disable-next-line no-await-in-loop
             names[u] = await displayName(u);
         }
 
-        return res.json({
-            clearance: obj,
-            viewer: caps,
-            names,
-            sla_days: settings.sla_days,
-        });
+        return res.json({ clearance: obj, viewer: caps, names, acting, sla_days: settings.sla_days });
     } catch (e) {
         return fail(res, "/detail", e);
     }
@@ -739,6 +856,8 @@ router.post("/task/act", auth, roleCheck(["user", "admin"]), async (req, res) =>
         if (!isSigner(org, settings, c, t, me.user, now)) {
             return forbidden(res, "You are not a signatory for this row");
         }
+        const principals = resolveSignerPrincipals(org, settings, c, t.signer_rule, now);
+        const actedFor = actingMap(org, principals, now)[me.user] || "";
 
         // Apply sub-item outcomes, only for items that exist on the row.
         const byCode = new Map(t.items.map((it) => [it.code, it]));
@@ -770,10 +889,18 @@ router.post("/task/act", auth, roleCheck(["user", "admin"]), async (req, res) =>
         t.note = note.slice(0, 2000);
         t.acted_by = me.user;
         t.acted_by_name = me.name;
+        t.acted_for = actedFor;
         t.acted_at = now;
         t.acted_ip = clientIp(req);
         t.acted_user_agent = String(req.headers["user-agent"] || "").slice(0, 300);
-        t.history.push({ at: now, by: me.user, action: "act", from, to: outcome, note: t.note });
+        t.history.push({
+            at: now,
+            by: me.user,
+            action: "act",
+            from,
+            to: outcome,
+            note: actedFor ? `${t.note} (acting for ${actedFor})`.trim() : t.note,
+        });
 
         const r = recompute(c, now);
         refreshSnapshots(org, settings, c, now);
@@ -863,7 +990,7 @@ router.post("/task/reassign", auth, roleCheck(["admin"]), async (req, res) => {
 
         if (t.status === "Pending" || t.status === "Outstanding") {
             await notifyUsers(
-                users,
+                effectiveActors(org, users, now),
                 payload("Exit clearance row assigned to you", `${c.employee_name} — ${t.label}`, "/clearance/inbox", "clearance_task")
             );
         }
@@ -917,6 +1044,241 @@ router.post("/task/reopen", auth, roleCheck(["user", "admin"]), async (req, res)
 });
 
 // ------------------------------------------------------------------
+// the benefits statement
+// ------------------------------------------------------------------
+
+const benefitsGuard = async (req, res, me) => {
+    const c = await Clearance.findById(req.body && req.body.id);
+    if (!c) {
+        notFound(res, "Clearance not found");
+        return null;
+    }
+    if (c.status !== "Open" && c.status !== "Awaiting Final Approval") {
+        conflict(res, `The clearance is ${c.status}`);
+        return null;
+    }
+    if (!c.benefits || !c.benefits.rows || !c.benefits.rows.length) {
+        conflict(res, "This clearance has no benefits statement");
+        return null;
+    }
+    if (c.benefits.issued) {
+        conflict(res, "The benefits statement has already been issued");
+        return null;
+    }
+    const now = new Date();
+    const { org, settings } = await ctx();
+    const fillers = benefitsFillers(org, settings, c, now);
+    return { c, now, org, settings, fillers, isFiller: fillers.includes(me.user) };
+};
+
+// The branch (or HR) fills rows: { id, values: { code: value } }.
+router.post("/benefits/fill", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const g = await benefitsGuard(req, res, me);
+        if (!g) return undefined;
+        const values = (req.body && req.body.values) || {};
+        if (!values || typeof values !== "object") return bad(res, "values must be an object of code → value");
+
+        let touched = 0;
+        for (const row of g.c.benefits.rows) {
+            if (!(row.code in values)) continue;
+            if (row.filled_by === "system") continue;
+            if (row.filled_by === "branch" && !(g.isFiller || me.isAdmin)) {
+                return forbidden(res, `"${row.label}" is the branch's to fill`);
+            }
+            if (row.filled_by === "hr" && !me.isAdmin) return forbidden(res, `"${row.label}" is HR's to fill`);
+            const v = String(values[row.code] || "").trim().slice(0, 500);
+            if (v !== row.value) {
+                row.value = v;
+                row.filled_by_user = me.user;
+                row.filled_at = g.now;
+                touched += 1;
+            }
+        }
+        if (touched) {
+            g.c.markModified("benefits");
+            await g.c.save();
+        }
+        return res.json({ error: false, benefits: g.c.benefits, touched });
+    } catch (e) {
+        return fail(res, "/benefits/fill", e);
+    }
+});
+
+// The branch hands its rows to HR.
+router.post("/benefits/submit-branch", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const g = await benefitsGuard(req, res, me);
+        if (!g) return undefined;
+        if (!(g.isFiller || me.isAdmin)) return forbidden(res, "Only the branch manager (or HR) can submit the branch rows");
+        if (!benefitsComplete(g.c.benefits, "branch")) return bad(res, "Fill every branch row first (write “None” where there is nothing).");
+        g.c.benefits.branch_submitted_by = me.user;
+        g.c.benefits.branch_submitted_at = g.now;
+        g.c.markModified("benefits");
+        await g.c.save();
+        await notifyAdmins(
+            payload("Benefits statement: branch rows submitted", `${g.c.employee_name} — HR rows are next`, "/clearance/inbox", "clearance_benefits")
+        );
+        return res.json({ error: false, benefits: g.c.benefits });
+    } catch (e) {
+        return fail(res, "/benefits/submit-branch", e);
+    }
+});
+
+// HR issues the statement: from now on the signatories (and the employee) see it.
+router.post("/benefits/issue", auth, roleCheck(["admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const g = await benefitsGuard(req, res, me);
+        if (!g) return undefined;
+        if (!benefitsComplete(g.c.benefits, "branch") || !benefitsComplete(g.c.benefits, "hr")) {
+            return bad(res, "Every branch and HR row must be filled before the statement is issued.");
+        }
+        const b = g.c.benefits;
+        b.hr_submitted_by = me.user;
+        b.hr_submitted_at = g.now;
+        b.issued = true;
+        b.issued_by = me.user;
+        b.issued_at = g.now;
+        g.c.markModified("benefits");
+        await g.c.save();
+
+        const signers = new Set();
+        (g.c.tasks || []).forEach((t) => {
+            if (t.status === "Pending" || t.status === "Outstanding") {
+                resolveSignersForRule(g.org, g.settings, g.c, t.signer_rule, g.now).forEach((u) => signers.add(u));
+            }
+        });
+        await notifyUsers(
+            [...signers],
+            payload("Benefits statement issued", `${g.c.employee_name} — the statement is now on the clearance form`, "/clearance/inbox", "clearance_benefits")
+        );
+        await notifyUsers([g.c.domain_user], payload("Your benefits statement has been issued", "It is now on your clearance.", "/user/clearance"));
+        return res.json({ error: false, benefits: g.c.benefits });
+    } catch (e) {
+        return fail(res, "/benefits/issue", e);
+    }
+});
+
+// ------------------------------------------------------------------
+// delegations
+// ------------------------------------------------------------------
+
+const decorateDelegation = async (d, now) => ({
+    ...d,
+    delegator_name: await displayName(d.delegator),
+    delegate_name: await displayName(d.delegate),
+    in_window: d.active !== false && inWindow(d.valid_from, d.valid_to, now),
+    expired: !!d.valid_to && new Date(d.valid_to) < now,
+});
+
+router.get("/delegations", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const now = new Date();
+        const all = me.isAdmin && String(req.query.all) === "1";
+        const filter = all ? {} : { $or: [{ delegator: me.user }, { delegate: me.user }] };
+        const rows = await ClearanceDelegation.find(filter).sort({ valid_from: -1 }).lean();
+        const out = [];
+        for (const d of rows) {
+            // eslint-disable-next-line no-await-in-loop
+            out.push(await decorateDelegation(d, now));
+        }
+        return res.json({ data: out });
+    } catch (e) {
+        return fail(res, "/delegations", e);
+    }
+});
+
+router.post("/delegations", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const b = req.body || {};
+        const delegator = me.isAdmin && b.delegator ? lc(b.delegator) : me.user;
+        const delegate = lc(b.delegate);
+        if (!delegate) return bad(res, "Pick who will act for you");
+        if (delegate === delegator) return bad(res, "You cannot delegate to yourself");
+        const idx = await userIndex();
+        if (!idx.get(delegate)) return notFound(res, `No portal user named "${delegate}"`);
+        if (!idx.get(delegator)) return notFound(res, `No portal user named "${delegator}"`);
+        const from = parseDate(b.valid_from);
+        const to = parseDate(b.valid_to);
+        if (!from || !to) return bad(res, "Give a start and an end date");
+        if (to < from) return bad(res, "The end date is before the start date");
+        const end = new Date(to);
+        end.setHours(23, 59, 59, 999);
+
+        // One delegation in force at a time per person: overlapping ones would
+        // make "who acts for me" ambiguous.
+        const overlap = await ClearanceDelegation.findOne({
+            delegator,
+            active: true,
+            valid_from: { $lte: end },
+            valid_to: { $gte: from },
+        }).lean();
+        if (overlap) return conflict(res, "A delegation already covers part of that period. End it first.");
+
+        const d = await ClearanceDelegation.create({
+            delegator,
+            delegate,
+            valid_from: from,
+            valid_to: end,
+            reason: String(b.reason || "").trim().slice(0, 500),
+            created_by: me.user,
+        });
+        await notifyUsers(
+            [delegate],
+            payload(
+                "You have been delegated clearance authority",
+                `${await displayName(delegator)} — ${from.toDateString()} to ${end.toDateString()}`,
+                "/clearance/delegate",
+                "clearance_delegation"
+            )
+        );
+        return res.status(201).json({ error: false, delegation: await decorateDelegation(d.toObject(), new Date()) });
+    } catch (e) {
+        return fail(res, "POST /delegations", e);
+    }
+});
+
+// Shorten, extend or end a delegation. Its holder, or HR.
+router.patch("/delegations/:id", auth, roleCheck(["user", "admin"]), async (req, res) => {
+    try {
+        const me = await whoami(req);
+        if (!me) return notFound(res, "User not found");
+        const d = await ClearanceDelegation.findById(req.params.id);
+        if (!d) return notFound(res, "Delegation not found");
+        if (!me.isAdmin && lc(d.delegator) !== me.user) return forbidden(res, "Only the person who delegated (or HR) can change it");
+        const b = req.body || {};
+        if (b.valid_to !== undefined) {
+            const to = parseDate(b.valid_to);
+            if (!to) return bad(res, "Invalid end date");
+            const end = new Date(to);
+            end.setHours(23, 59, 59, 999);
+            if (end < d.valid_from) return bad(res, "The end date is before the start date");
+            d.valid_to = end;
+        }
+        if (b.active !== undefined) d.active = !!b.active;
+        if (b.end_now) {
+            d.valid_to = new Date();
+            d.active = false;
+        }
+        d.updated_by = me.user;
+        await d.save();
+        return res.json({ error: false, delegation: await decorateDelegation(d.toObject(), new Date()) });
+    } catch (e) {
+        return fail(res, "PATCH /delegations/:id", e);
+    }
+});
+
+// ------------------------------------------------------------------
 // HR oversight
 // ------------------------------------------------------------------
 
@@ -937,9 +1299,10 @@ router.get("/list", auth, roleCheck(["admin"]), async (req, res) => {
         }
         const page = Math.max(1, Number(req.query.page) || 1);
         const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 25));
+        const sort = req.query.status === "Approved" ? { release_date: 1 } : { createdAt: -1 };
         const [rows, total] = await Promise.all([
             Clearance.find(filter)
-                .sort({ createdAt: -1 })
+                .sort(sort)
                 .skip((page - 1) * limit)
                 .limit(limit)
                 .lean(),
@@ -970,16 +1333,17 @@ router.post("/cancel", auth, roleCheck(["admin"]), async (req, res) => {
     }
 });
 
+// HR opens the signatories for an approved departure. This is the gate the
+// clock never passes on its own.
 router.post("/open-now", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const me = await whoami(req);
         if (!me) return notFound(res, "User not found");
         const c = await Clearance.findById(req.body && req.body.id);
         if (!c) return notFound(res, "Clearance not found");
-        if (c.status !== "Approved") return conflict(res, `Only an Approved clearance can be opened early (this one is ${c.status})`);
-        await ensureSeeded(me.user);
+        if (c.status !== "Approved") return conflict(res, `Only an Approved clearance can be opened (this one is ${c.status})`);
         const { org, settings } = await ctx();
-        await openNow(c, org, settings, new Date());
+        await openSignatories(c, org, settings, me.user, new Date());
         return res.json({ error: false, clearance: summarize(c) });
     } catch (e) {
         return fail(res, "/open-now", e);
@@ -1211,6 +1575,7 @@ const chainWithNames = async (org, settings, user, now) => {
             name: await displayName(u),
             role: m ? m.member.role_in_unit : headsAnyUnit(org, u, now) ? "Unit head" : "",
             unit_name: m && m.unit ? m.unit.name : "",
+            acting: actingFor(org, u, now),
         });
     }
     return out;
@@ -1534,11 +1899,15 @@ router.get("/settings", auth, roleCheck(["admin"]), async (req, res) => {
     try {
         const s = await ClearanceSettings.get();
         const obj = s.toObject();
+        const branches = await ClearanceUnit.find({ kind: "branch", active: true }, { name: 1, code: 1 }).sort({ code: 1 }).lean();
+        const service = obj.service_branch_id ? branches.find((b) => String(b._id) === String(obj.service_branch_id)) : null;
         return res.json({
             settings: obj,
             ceo_name: obj.ceo_user ? await displayName(obj.ceo_user) : "",
             ceo_delegate_name: obj.ceo_delegate_user ? await displayName(obj.ceo_delegate_user) : "",
             delegate_active: !!obj.ceo_delegate_user && inWindow(obj.ceo_delegate_from, obj.ceo_delegate_to),
+            branches,
+            service_branch: service ? { _id: service._id, code: service.code, name: service.name } : null,
         });
     } catch (e) {
         return fail(res, "/settings", e);
@@ -1593,6 +1962,32 @@ router.put("/settings", auth, roleCheck(["admin"]), async (req, res) => {
                 return bad(res, "Only one role can head a department, and only one a branch");
             }
             s.roles = roles;
+        }
+        if (b.benefits_rows !== undefined) {
+            if (!Array.isArray(b.benefits_rows) || !b.benefits_rows.length) return bad(res, "The benefits statement needs at least one row");
+            const seen = new Set();
+            const rows = [];
+            for (const r of b.benefits_rows) {
+                const label = String((r && r.label) || "").trim();
+                if (!label) return bad(res, "Every benefits row needs a label");
+                const code = String((r && r.code) || "").trim() || label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+                if (seen.has(code)) return bad(res, `Benefits row code "${code}" is used twice`);
+                seen.add(code);
+                const filled_by = ["system", "branch", "hr"].includes(r.filled_by) ? r.filled_by : "hr";
+                const system_source = filled_by === "system" && ["date_of_employment", "release_date"].includes(r.system_source) ? r.system_source : "";
+                if (filled_by === "system" && !system_source) return bad(res, `Row "${label}": a system row needs a source (date of employment or release date)`);
+                rows.push({ code, label, filled_by, system_source });
+            }
+            s.benefits_rows = rows;
+        }
+        if (b.service_branch_id !== undefined) {
+            if (!b.service_branch_id) {
+                s.service_branch_id = undefined;
+            } else {
+                const branch = await ClearanceUnit.findById(b.service_branch_id).lean();
+                if (!branch || branch.kind !== "branch") return bad(res, "The service branch must be a branch from the registry");
+                s.service_branch_id = branch._id;
+            }
         }
         s.updated_by = me.user;
         await s.save();

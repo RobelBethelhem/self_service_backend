@@ -4,7 +4,7 @@ const Schema = mongoose.Schema;
 // One employee's exit clearance, from the moment a departure is recorded to
 // the moment the President/CEO's line is signed.
 //
-// Two phases live in one document:
+// Three phases live in one document:
 //
 //   1. Approval of the departure itself. An employee-initiated resignation
 //      goes to the Immediate Supervisor, then to HR; either may reject with a
@@ -12,10 +12,14 @@ const Schema = mongoose.Schema;
 //      departures (dismissal, retirement, contract end…) skip straight to
 //      Approved — HR is the authority there.
 //
-//   2. The clearance form. Opens on the release date (immediately, if the
-//      release is immediate). Rows are snapshotted from the active template,
-//      signed in parallel unless the template says otherwise, and the final
-//      row — the CEO's — completes it.
+//   2. HR opens the signatories. Approval alone opens nothing: an approved
+//      departure waits until HR explicitly opens the form, and until then the
+//      employee may still withdraw. Opening snapshots the rows from the active
+//      template and the benefits statement from settings.
+//
+//   3. The clearance form. Rows are signed in parallel unless the template
+//      says otherwise; the branch and HR complete the benefits statement and
+//      issue it to the signatories; the final row — the CEO's — completes it.
 //
 // Tasks are embedded rather than a separate collection so that a row's
 // outcome and the overall status change in one atomic write.
@@ -24,7 +28,7 @@ export const CLEARANCE_STATUSES = [
     "Pending Supervisor",
     "Pending HR",
     "Rejected",
-    "Approved", // departure approved, waiting for the release date
+    "Approved", // departure approved, waiting for HR to open the signatories
     "Open", // form open, rows being signed
     "Awaiting Final Approval", // every non-final row done; CEO line pending
     "Cleared",
@@ -54,6 +58,8 @@ const decisionSchema = new Schema(
         // Set when HR acted at the supervisor stage because none was mapped
         // or the supervisor was unavailable.
         on_behalf: { type: Boolean, default: false },
+        // Set when a delegate decided in the supervisor's place.
+        acting_for: { type: String, trim: true, lowercase: true, default: "" },
     },
     { _id: false }
 );
@@ -92,7 +98,8 @@ const taskSchema = new Schema(
         // Snapshot of the template's rule, plus any HR reassignment. Signers
         // are resolved LIVE against this rule at every request, never trusted
         // from a stored list — an expired head appointment must stop working
-        // the moment it expires.
+        // the moment it expires, and a delegation must start the moment it
+        // begins.
         signer_rule: {
             mode: { type: String, enum: ["supervisor", "unit_head", "users", "ceo"], required: true },
             unit_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit" },
@@ -115,6 +122,8 @@ const taskSchema = new Schema(
 
         acted_by: { type: String, trim: true, lowercase: true },
         acted_by_name: { type: String, trim: true },
+        // The signatory a delegate signed for, when that is what happened.
+        acted_for: { type: String, trim: true, lowercase: true, default: "" },
         acted_at: { type: Date },
         acted_ip: { type: String, trim: true },
         acted_user_agent: { type: String, trim: true },
@@ -133,6 +142,20 @@ const taskSchema = new Schema(
         escalated_at: { type: Date },
 
         history: { type: [taskHistorySchema], default: [] },
+    },
+    { _id: false }
+);
+
+// One line of the benefits statement, as snapshotted when the form opened.
+const benefitRowSchema = new Schema(
+    {
+        code: { type: String, required: true, trim: true },
+        label: { type: String, required: true, trim: true },
+        filled_by: { type: String, enum: ["system", "branch", "hr"], default: "hr" },
+        system_source: { type: String, default: "" },
+        value: { type: String, trim: true, default: "" },
+        filled_by_user: { type: String, trim: true, lowercase: true, default: "" },
+        filled_at: { type: Date },
     },
     { _id: false }
 );
@@ -163,8 +186,10 @@ const clearanceSchema = new Schema(
         immediate: { type: Boolean, default: false },
         reason: { type: String, trim: true, default: "" },
         additional_statement: { type: String, trim: true, default: "" },
-        // The formatted resignation letter as it read when submitted.
+        // The formatted resignation letter as it read when submitted: the
+        // plain text for the record, and its parts for rendering as a letter.
         resignation_letter: { type: String, default: "" },
+        resignation_letter_parts: { type: Schema.Types.Mixed },
 
         // ---- approval chain ----
         status: { type: String, enum: CLEARANCE_STATUSES, required: true, index: true },
@@ -175,12 +200,31 @@ const clearanceSchema = new Schema(
         decision_history: { type: [decisionSchema], default: [] },
         submitted_at: { type: Date },
         approved_at: { type: Date },
+        // Sent once, when an approved departure's release date arrives and
+        // HR has not yet opened the signatories.
+        release_reminder_sent_at: { type: Date },
 
         // ---- the form ----
         template_id: { type: Schema.Types.ObjectId, ref: "ClearanceTemplate" },
         template_version: { type: Number },
         opened_at: { type: Date },
+        opened_by: { type: String, trim: true, lowercase: true },
         tasks: { type: [taskSchema], default: [] },
+
+        // ---- the benefits statement ----
+        benefits: {
+            rows: { type: [benefitRowSchema], default: [] },
+            branch_unit_id: { type: Schema.Types.ObjectId, ref: "ClearanceUnit" },
+            branch_unit_code: { type: String, trim: true, default: "" },
+            branch_unit_name: { type: String, trim: true, default: "" },
+            branch_submitted_by: { type: String, trim: true, lowercase: true },
+            branch_submitted_at: { type: Date },
+            hr_submitted_by: { type: String, trim: true, lowercase: true },
+            hr_submitted_at: { type: Date },
+            issued: { type: Boolean, default: false },
+            issued_by: { type: String, trim: true, lowercase: true },
+            issued_at: { type: Date },
+        },
 
         // ---- completion ----
         certificate_number: { type: String, trim: true },

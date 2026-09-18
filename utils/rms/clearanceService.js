@@ -8,19 +8,25 @@
 // database in them can be exercised exhaustively in a test.
 //
 // Terminology:
-//   org      — every active ClearanceUnit and ClearanceUnitMember, indexed
+//   org      — every active ClearanceUnit, ClearanceUnitMember and
+//              ClearanceDelegation, indexed
 //   rule     — a task's signer_rule { mode, unit_id, users }
 //   window   — a from/to validity pair; "in window" means today is inside it
+//   principal / actor — the person a rule names, and the person who may act
+//              for them today (themselves, or their delegate)
 
 import User from "../../models/rms/User.js";
 import Clearance from "../../models/rms/Clearance.js";
 import ClearanceUnit from "../../models/rms/ClearanceUnit.js";
 import ClearanceUnitMember from "../../models/rms/ClearanceUnitMember.js";
+import ClearanceDelegation from "../../models/rms/ClearanceDelegation.js";
 import ClearanceTemplate from "../../models/rms/ClearanceTemplate.js";
-import ClearanceSettings, { DEFAULT_ROLES } from "../../models/rms/ClearanceSettings.js";
+import ClearanceSettings, { DEFAULT_ROLES, DEFAULT_BENEFITS_ROWS } from "../../models/rms/ClearanceSettings.js";
 import ClearanceCounter from "../../models/rms/ClearanceCounter.js";
 import PushNotificationService from "./pushNotificationService.js";
 import { getEmployeeIdentity } from "./test.js";
+
+export { DEFAULT_ROLES, DEFAULT_BENEFITS_ROWS };
 
 // ------------------------------------------------------------------
 // small helpers
@@ -63,25 +69,8 @@ export const startOfDayEAT = (d) => {
 };
 
 // ------------------------------------------------------------------
-// org: the reporting tree, loaded once per request and resolved in memory
+// roles
 // ------------------------------------------------------------------
-//
-// Every registered person is a NODE: who they report to, the role they hold,
-// and the unit (department or branch) they belong to, inside a validity
-// window. A department's tree starts at its Director; beneath sit district
-// managers, division managers, branch managers and heads, each with people
-// beneath them in turn — Branch Management, for instance, has two district
-// managers whose branch managers each register their own branch staff.
-//
-// Two rules make the tree maintainable without HR typing 2,500 names:
-//   - anyone whose ROLE manages may register people under themselves, and may
-//     edit anyone anywhere beneath them (a Director can fix a branch);
-//   - HR may do anything.
-//
-// The Immediate Supervisor of a person is their node's reports_to. That is the
-// whole reason the tree exists.
-
-export { DEFAULT_ROLES };
 
 const rolesOf = (settings) =>
     settings && Array.isArray(settings.roles) && settings.roles.length ? settings.roles : DEFAULT_ROLES;
@@ -104,7 +93,24 @@ export const headRoleFor = (settings, kind) => {
     return r ? r.label : kind === "branch" ? "Branch Manager" : "Director";
 };
 
-export const indexOrg = (units, members) => {
+// ------------------------------------------------------------------
+// org: the reporting tree, loaded once per request and resolved in memory
+// ------------------------------------------------------------------
+//
+// Every registered person is a NODE: who they report to, the role they hold,
+// and the unit (department or branch) they belong to, inside a validity
+// window. A department's tree starts at its Director; beneath sit district
+// managers, division managers, branch managers and heads, each with people
+// beneath them in turn.
+//
+// Two rules make the tree maintainable without HR typing 2,500 names:
+//   - anyone whose ROLE manages may register people under themselves, and may
+//     edit anyone anywhere beneath them (a Director can fix a branch);
+//   - HR may do anything.
+//
+// The Immediate Supervisor of a person is their node's reports_to.
+
+export const indexOrg = (units, members, delegations = []) => {
     const unitsById = new Map();
     units.forEach((u) => unitsById.set(String(u._id), u));
 
@@ -125,15 +131,27 @@ export const indexOrg = (units, members) => {
         }
     });
 
-    return { units, unitsById, membersByUser, membersByUnit, childrenByManager };
+    const delegationsByUser = new Map();
+    const delegationsByDelegate = new Map();
+    delegations.forEach((d) => {
+        const from = lc(d.delegator);
+        const to = lc(d.delegate);
+        if (!delegationsByUser.has(from)) delegationsByUser.set(from, []);
+        delegationsByUser.get(from).push(d);
+        if (!delegationsByDelegate.has(to)) delegationsByDelegate.set(to, []);
+        delegationsByDelegate.get(to).push(d);
+    });
+
+    return { units, unitsById, membersByUser, membersByUnit, childrenByManager, delegationsByUser, delegationsByDelegate };
 };
 
 export const loadOrg = async () => {
-    const [units, members] = await Promise.all([
+    const [units, members, delegations] = await Promise.all([
         ClearanceUnit.find({ active: true }).lean(),
         ClearanceUnitMember.find({ active: true }).lean(),
+        ClearanceDelegation.find({ active: true }).lean(),
     ]);
-    return indexOrg(units, members);
+    return indexOrg(units, members, delegations);
 };
 
 // The person's current position: their in-window node and its unit. When a
@@ -238,9 +256,7 @@ export const canManageUser = (org, settings, me, target, now = new Date()) =>
     lc(me) !== lc(target) && subtreeUsers(org, me, now, { includeExpired: true }).has(lc(target));
 
 // May `me` register a person who will report to `manager`? Under myself if I
-// manage; under someone beneath me if THEY manage — the hierarchy the user
-// described, where a district manager registers branch managers who in turn
-// register their staff.
+// manage; under someone beneath me if THEY manage.
 export const canRegisterUnder = (org, settings, me, manager, now = new Date()) => {
     const i = lc(me);
     const m = lc(manager);
@@ -258,8 +274,49 @@ export const wouldCycle = (org, user, newManager, now = new Date()) => {
     return subtreeUsers(org, u, now, { includeExpired: true }).has(m);
 };
 
-// Everyone currently allowed to sign a task whose rule is `rule`.
-export const resolveSignersForRule = (org, settings, clearance, rule, now = new Date()) => {
+// ------------------------------------------------------------------
+// delegation: who acts for whom today
+// ------------------------------------------------------------------
+
+// The delegate currently standing in for `principal`, or "" if none. While a
+// delegation is in force the delegate REPLACES the principal — that is what
+// "the signatory is that delegate person" means — and the moment its window
+// closes, authority is the principal's again without anyone doing anything.
+export const actingFor = (org, principal, now = new Date()) => {
+    const list = (org.delegationsByUser && org.delegationsByUser.get(lc(principal))) || [];
+    const d = list.find((x) => x.active !== false && inWindow(x.valid_from, x.valid_to, now));
+    return d ? lc(d.delegate) : "";
+};
+
+// Everyone `user` is currently standing in for.
+export const principalsOf = (org, user, now = new Date()) =>
+    uniq(
+        ((org.delegationsByDelegate && org.delegationsByDelegate.get(lc(user))) || [])
+            .filter((x) => x.active !== false && inWindow(x.valid_from, x.valid_to, now))
+            .map((x) => lc(x.delegator))
+    );
+
+// The people who may act today for a list of principals.
+export const effectiveActors = (org, principals, now = new Date()) =>
+    uniq((principals || []).filter(Boolean).map((p) => actingFor(org, p, now) || lc(p)));
+
+// { delegate: principal } for the principals in the list that are delegated
+// today — what the screen needs to print "X (for Y)".
+export const actingMap = (org, principals, now = new Date()) => {
+    const out = {};
+    uniq((principals || []).map(lc)).forEach((p) => {
+        const d = actingFor(org, p, now);
+        if (d) out[d] = p;
+    });
+    return out;
+};
+
+// ------------------------------------------------------------------
+// signers
+// ------------------------------------------------------------------
+
+// The people a task's rule NAMES — before delegation is applied.
+export const resolveSignerPrincipals = (org, settings, clearance, rule, now = new Date()) => {
     if (!rule) return [];
     switch (rule.mode) {
         case "supervisor": {
@@ -294,6 +351,11 @@ export const resolveSignersForRule = (org, settings, clearance, rule, now = new 
             return [];
     }
 };
+
+// Everyone currently allowed to sign a task whose rule is `rule` — the named
+// people, each replaced by their delegate while one is in force.
+export const resolveSignersForRule = (org, settings, clearance, rule, now = new Date()) =>
+    effectiveActors(org, resolveSignerPrincipals(org, settings, clearance, rule, now), now);
 
 export const isSigner = (org, settings, clearance, task, user, now = new Date()) =>
     resolveSignersForRule(org, settings, clearance, task.signer_rule, now).includes(lc(user));
@@ -345,6 +407,7 @@ export const buildTree = async (org, settings, rootUser, viewer, now = new Date(
             name: nameOf(u),
             node,
             supervisor: resolveSupervisor(org, u, now),
+            acting_for_me: actingFor(org, u, now),
             manages: isManagerUser(org, settings, u, now),
             heads_units: org.units
                 .filter((x) => lc(x.head_user) === u && x.active !== false)
@@ -493,57 +556,153 @@ export const refreshSnapshots = (org, settings, clearance, now = new Date()) => 
     });
 };
 
+// ------------------------------------------------------------------
+// the benefits statement
+// ------------------------------------------------------------------
+
+// Which branch fills the branch rows: the employee's own branch, or — for
+// head-office staff — the service branch chosen in settings.
+export const benefitsBranchUnit = (org, settings, clearance) => {
+    if (clearance.unit_kind === "branch" && clearance.unit_id) {
+        return org.unitsById.get(String(clearance.unit_id)) || null;
+    }
+    if (settings && settings.service_branch_id) {
+        return org.unitsById.get(String(settings.service_branch_id)) || null;
+    }
+    return null;
+};
+
+// The branch's manager, plus anyone in the branch with delegated signing.
+export const benefitsFillerPrincipals = (org, unit, now = new Date()) => {
+    if (!unit || unit.active === false) return [];
+    const head = unitHeadIfValid(unit, now);
+    const delegates = (org.membersByUnit.get(String(unit._id)) || [])
+        .filter((m) => m.can_sign_clearance && m.active !== false && inWindow(m.valid_from, m.valid_to, now))
+        .map((m) => lc(m.domain_user));
+    return uniq([head, ...delegates]);
+};
+
+export const benefitsFillers = (org, settings, clearance, now = new Date()) => {
+    const unit =
+        clearance.benefits && clearance.benefits.branch_unit_id
+            ? org.unitsById.get(String(clearance.benefits.branch_unit_id)) || null
+            : benefitsBranchUnit(org, settings, clearance);
+    return effectiveActors(org, benefitsFillerPrincipals(org, unit, now), now);
+};
+
+const systemBenefitValue = (row, clearance) => {
+    switch (row.system_source) {
+        case "date_of_employment":
+            return fmtLongDate(clearance.date_of_employment);
+        case "release_date":
+            return fmtLongDate(clearance.release_date);
+        default:
+            return "";
+    }
+};
+
+// Snapshot the statement's rows from settings when the form opens.
+export const buildBenefits = (settings, clearance, unit) => {
+    const rows =
+        settings && settings.benefits_rows && settings.benefits_rows.length
+            ? settings.benefits_rows
+            : DEFAULT_BENEFITS_ROWS;
+    return {
+        rows: rows.map((r) => ({
+            code: r.code,
+            label: r.label,
+            filled_by: r.filled_by || "hr",
+            system_source: r.system_source || "",
+            value: r.filled_by === "system" ? systemBenefitValue(r, clearance) : "",
+            filled_by_user: r.filled_by === "system" ? "system" : "",
+            filled_at: r.filled_by === "system" ? new Date() : undefined,
+        })),
+        branch_unit_id: unit ? unit._id : undefined,
+        branch_unit_code: unit ? unit.code : "",
+        branch_unit_name: unit ? unit.name : "",
+        issued: false,
+    };
+};
+
+// Are all rows of a kind filled in?
+export const benefitsComplete = (benefits, filledBy) =>
+    !!benefits &&
+    (benefits.rows || []).filter((r) => r.filled_by === filledBy).every((r) => String(r.value || "").trim());
+
+// ------------------------------------------------------------------
+// viewer capabilities
+// ------------------------------------------------------------------
+
 // What the current viewer may do with this clearance. Computed server-side so
 // the UI never has to reimplement authorisation.
 export const viewerCapabilities = (org, settings, clearance, me, isAdmin, now = new Date()) => {
     const user = lc(me);
     const isOwner = lc(clearance.domain_user) === user;
     const supervisor = lc(clearance.supervisor_user);
+    const supAllowed = supervisor ? effectiveActors(org, [supervisor], now) : [];
+    const isSupervisorActor = supAllowed.includes(user);
     const st = clearance.status;
 
     let decideStage = "";
-    if (st === "Pending Supervisor" && (user === supervisor || isAdmin)) decideStage = "supervisor";
+    if (st === "Pending Supervisor" && (isSupervisorActor || isAdmin)) decideStage = "supervisor";
     if (st === "Pending HR" && isAdmin) decideStage = "hr";
 
+    const inSigning = st === "Open" || st === "Awaiting Final Approval";
     const canAct = [];
     const canVerify = [];
     const canReopen = [];
     let isSignerAnywhere = false;
-    if (st === "Open" || st === "Awaiting Final Approval") {
-        (clearance.tasks || []).forEach((t) => {
-            const signer = isSigner(org, settings, clearance, t, user, now);
-            if (signer) isSignerAnywhere = true;
-            if (t.signature_mode === "manual") {
-                if (isAdmin && (t.status === "Pending" || t.status === "Outstanding")) canVerify.push(t.code);
-            } else if (signer && (t.status === "Pending" || t.status === "Outstanding")) {
-                canAct.push(t.code);
-            }
-            if (!t.is_final && t.status === "Cleared" && (signer || isAdmin)) canReopen.push(t.code);
-        });
-    } else {
-        isSignerAnywhere = (clearance.tasks || []).some((t) =>
-            isSigner(org, settings, clearance, t, user, now)
-        );
-    }
+    (clearance.tasks || []).forEach((t) => {
+        const signer = isSigner(org, settings, clearance, t, user, now);
+        if (signer) isSignerAnywhere = true;
+        if (!inSigning) return;
+        if (t.signature_mode === "manual") {
+            if (isAdmin && (t.status === "Pending" || t.status === "Outstanding")) canVerify.push(t.code);
+        } else if (signer && (t.status === "Pending" || t.status === "Outstanding")) {
+            canAct.push(t.code);
+        }
+        if (!t.is_final && t.status === "Cleared" && (signer || isAdmin)) canReopen.push(t.code);
+    });
+
+    const b = clearance.benefits && clearance.benefits.rows && clearance.benefits.rows.length ? clearance.benefits : null;
+    const fillers = b ? benefitsFillers(org, settings, clearance, now) : [];
+    const isFiller = fillers.includes(user);
+    const issued = !!(b && b.issued);
 
     return {
         is_admin: isAdmin,
         is_owner: isOwner,
-        is_supervisor: user === supervisor,
+        is_supervisor: user === supervisor || isSupervisorActor,
+        acting_for_supervisor: isSupervisorActor && user !== supervisor ? supervisor : "",
         is_signer: isSignerAnywhere,
         decide_stage: decideStage,
         can_act: canAct,
         can_verify_manual: canVerify,
         can_reopen: canReopen,
-        can_reassign: isAdmin && (st === "Open" || st === "Awaiting Final Approval"),
+        can_reassign: isAdmin && inSigning,
         can_cancel: isAdmin && st !== "Cleared" && st !== "Cancelled",
+        // Withdrawal stays possible right up to the moment HR opens the
+        // signatories — approval alone does not close the door.
         can_withdraw: isOwner && ["Pending Supervisor", "Pending HR", "Rejected", "Approved"].includes(st),
         can_resubmit: isOwner && st === "Rejected",
         can_open_now: isAdmin && st === "Approved",
-        // The signature form (for the CEO's hand signature) exists once every
-        // departmental row is done; the certificate only once the CEO's line is.
         can_print_form: st === "Awaiting Final Approval" || st === "Cleared",
         can_print_certificate: st === "Cleared",
+        benefits: {
+            exists: !!b,
+            issued,
+            is_filler: isFiller,
+            fillers,
+            can_fill_branch: inSigning && !!b && !issued && (isFiller || isAdmin),
+            can_fill_hr: inSigning && !!b && !issued && isAdmin,
+            can_submit_branch: inSigning && !!b && !issued && !b.branch_submitted_at && (isFiller || isAdmin),
+            can_issue: inSigning && !!b && !issued && isAdmin,
+            can_view:
+                !!b &&
+                (isAdmin ||
+                    isFiller ||
+                    (issued && (isOwner || isSignerAnywhere || user === supervisor || isSupervisorActor))),
+        },
     };
 };
 
@@ -589,43 +748,60 @@ export const snapshotEmployee = async (userDoc) => {
 // The fixed format every employee-initiated resignation is written in. The
 // employee supplies the reason, the date and an optional statement; the letter
 // itself is generated so that every resignation on file reads the same way.
-export const renderResignationLetter = (c, now = new Date()) => {
+//
+// Returned as parts so the screen can lay it out like a letter — date at the
+// top right, subject bold and underlined — while the plain-text form below is
+// what goes on the record and into search.
+export const ADDRESSEE_LINES = ["Deputy Chief Human Capital", "Zemen Bank S.C.", "Addis Ababa"];
+export const LETTER_SUBJECT = "Letter of Resignation";
+
+export const renderResignationLetterParts = (c, now = new Date()) => {
     const effective = c.immediate
         ? "take effect immediately"
         : `take effect on ${fmtLongDate(c.release_date)}, and I will serve the notice period until that date`;
-    const lines = [
-        `Date: ${fmtLongDate(now)}`,
-        "",
-        "To: Zemen Bank S.C.",
-        "    Talent Acquisition, Development & Management Department",
-        "    Addis Ababa",
-        "",
-        "Subject: Letter of Resignation",
-        "",
-        "Dear Sir/Madam,",
-        "",
+    const paragraphs = [
         `I, ${c.employee_name}${c.job_title ? `, ${c.job_title}` : ""}${
             c.department ? ` in the ${c.department}` : ""
         }, hereby tender my resignation from my position at Zemen Bank S.C.${
             c.date_of_employment ? ` I have been serving the Bank since ${fmtLongDate(c.date_of_employment)}.` : ""
         }`,
-        "",
         `I request that my resignation ${effective}.`,
-        "",
         `Reason for resignation: ${c.reason || "—"}`,
     ];
-    if (c.additional_statement) lines.push("", c.additional_statement);
-    lines.push(
-        "",
-        "I am committed to completing the exit clearance process and properly handing over my responsibilities before my release. I am grateful for the opportunities and support I have received during my time with the Bank.",
-        "",
-        "Sincerely,",
-        "",
-        c.employee_name,
-        c.employee_id ? `Employee ID: ${c.employee_id}` : "",
-        c.job_title || ""
+    if (c.additional_statement) paragraphs.push(String(c.additional_statement));
+    paragraphs.push(
+        "I am committed to completing the exit clearance process and properly handing over my responsibilities before my release. I am grateful for the opportunities and support I have received during my time with the Bank."
     );
-    return lines.filter((l, i, arr) => !(l === "" && arr[i - 1] === "")).join("\n");
+    return {
+        date: fmtLongDate(now),
+        to: [...ADDRESSEE_LINES],
+        subject: LETTER_SUBJECT,
+        salutation: "Dear Sir/Madam,",
+        paragraphs,
+        closing: "Sincerely,",
+        signature: [c.employee_name, c.employee_id ? `Employee ID: ${c.employee_id}` : "", c.job_title || ""].filter(
+            Boolean
+        ),
+    };
+};
+
+export const renderResignationLetter = (c, now = new Date()) => {
+    const p = renderResignationLetterParts(c, now);
+    return [
+        `Date: ${p.date}`,
+        "",
+        `To: ${p.to[0]}`,
+        ...p.to.slice(1).map((l) => `    ${l}`),
+        "",
+        `Subject: ${p.subject}`,
+        "",
+        p.salutation,
+        "",
+        ...p.paragraphs.flatMap((x) => [x, ""]),
+        p.closing,
+        "",
+        ...p.signature,
+    ].join("\n");
 };
 
 // ------------------------------------------------------------------
@@ -836,7 +1012,7 @@ export const ensureSeeded = async (by = "system") => {
 };
 
 // ------------------------------------------------------------------
-// scheduler: open on release date, remind, escalate
+// scheduler: release-date reminders, sign-off reminders, escalations
 // ------------------------------------------------------------------
 
 const DAY = 24 * 3600 * 1000;
@@ -847,27 +1023,27 @@ export const tick = async () => {
     ticking = true;
     const now = new Date();
     try {
-        // 1. Approved departures whose release date has arrived.
-        const due = await Clearance.find({ status: "Approved", release_date: { $lte: now } });
-        if (due.length) {
-            await ensureSeeded("system");
-            const template = await ClearanceTemplate.findOne({ active: true }).lean();
-            const [org, settings] = [await loadOrg(), await ClearanceSettings.get()];
-            for (const c of due) {
-                if (!template) break;
-                const r = openClearance(c, template, now);
-                refreshSnapshots(org, settings, c, now);
-                // eslint-disable-next-line no-await-in-loop
-                await c.save();
-                // eslint-disable-next-line no-await-in-loop
-                await notifyNewlyPending(org, settings, c, r.newlyPending);
-                // eslint-disable-next-line no-await-in-loop
-                await notifyUsers(
-                    [c.domain_user],
-                    payload("Your exit clearance is open", "Departments have been notified.", "/user/clearance")
-                );
-                console.log(`[clearance] opened ${c._id} for ${c.domain_user} on release date`);
-            }
+        // 1. Approved departures whose release date has arrived and whose
+        //    signatories HR has not yet opened. Opening is HR's decision, not
+        //    the clock's — the clock only reminds them, once.
+        const due = await Clearance.find({
+            status: "Approved",
+            release_date: { $lte: now },
+            release_reminder_sent_at: null,
+        });
+        for (const c of due) {
+            // eslint-disable-next-line no-await-in-loop
+            await notifyAdmins(
+                payload(
+                    "Release date reached — open the signatories",
+                    `${c.employee_name} (${c.termination_type}) — release ${c.release_date.toDateString()}`,
+                    "/admin/clearance/open",
+                    "clearance_open"
+                )
+            );
+            c.release_reminder_sent_at = now;
+            // eslint-disable-next-line no-await-in-loop
+            await c.save();
         }
 
         // 2. Reminders and escalations for rows nobody has acted on.
@@ -935,10 +1111,9 @@ export const tick = async () => {
 let timer = null;
 export const startScheduler = () => {
     if (timer) return;
-    // First pass shortly after boot so a restart never delays a release-date
-    // opening by a full interval; then every fifteen minutes. Every action in
-    // tick() is idempotent, so an overlapping process would only repeat a
-    // harmless read.
+    // First pass shortly after boot so a restart never delays a reminder by a
+    // full interval; then every fifteen minutes. Every action in tick() is
+    // idempotent, so an overlapping process would only repeat a harmless read.
     setTimeout(() => tick().catch(() => {}), 45 * 1000);
     timer = setInterval(() => tick().catch(() => {}), 15 * 60 * 1000);
     if (typeof timer.unref === "function") timer.unref();
