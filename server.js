@@ -25,6 +25,7 @@ import ServiceRating from "./routes/rms/ServiceRating.js"
 import AnnouncementRoutes from "./routes/rms/Announcement.js"
 import HrisReportRoutes from "./routes/rms/HrisReport.js"
 import FaqRoutes from "./routes/rms/Faq.js"
+import ProfileRoutes from "./routes/rms/Profile.js"
 // Exit clearance — independent module; see routes/rms/Clearance.js.
 import ClearanceRoutes from "./routes/rms/Clearance.js"
 import { startScheduler as startClearanceScheduler } from "./utils/rms/clearanceService.js"
@@ -903,6 +904,7 @@ app.use("/zbss/api/users", userRoutes);
   app.use("/zbss/api/announcement", AnnouncementRoutes);
   app.use("/zbss/api/hris-report", HrisReportRoutes);
   app.use("/zbss/api/faq", FaqRoutes);
+  app.use("/zbss/api/profile", ProfileRoutes);
   app.use("/zbss/api/clearance", ClearanceRoutes);
 
  
