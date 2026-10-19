@@ -23,8 +23,11 @@ export const normalizeLogin = (value) => {
 //   1  education   degrees (latest first), then certifications
 //   2  training    newest first, undated last
 //   3  jobs        internal postings (current first), then previous employers
-//   4  salary      pre-adjustment backup -> adjustment upload -> current
-//   5  history     when the EmployeeDetail row was created / edited, and by whom
+//   4  history     when the EmployeeDetail row was created / edited, and by whom
+//
+// Salary is the current figure only (person.Salary). The pre-adjustment side
+// tables are deliberately not read: the profile shows today's salary, not its
+// history.
 export const PROFILE_SQL = `
 SET NOCOUNT ON;
 
@@ -228,53 +231,7 @@ CROSS APPLY (SELECT M = CASE WHEN pr.S IS NULL OR pr.X <= pr.S THEN NULL   -- mi
 WHERE e.UserId = @UserId
 ORDER BY e.ExperienceType, CASE WHEN e.[To] IS NULL THEN 0 ELSE 1 END, e.[From] DESC, e.Id DESC;
 
-/* 4  SALARY - HRIS keeps ONE live salary and no dated history. Two side
-      tables keep earlier figures: EmployeeDetailbk (copy taken before an
-      adjustment) and empupload (the adjustment file). Each is read only if it
-      exists, and a read the portal's login is not allowed is skipped, so the
-      current salary always comes back.  */
-DECLARE @Stages TABLE (Seq int, Stage nvarchar(60), Amount decimal(18, 2));
-
-IF OBJECT_ID('dbo.EmployeeDetailbk', 'U') IS NOT NULL
-BEGIN
-    BEGIN TRY
-        INSERT @Stages (Seq, Stage, Amount)
-        SELECT 1, N'Before salary adjustment', b.Salary
-        FROM dbo.EmployeeDetailbk b
-        WHERE b.UserId = @UserId AND b.Salary IS NOT NULL;
-    END TRY
-    BEGIN CATCH
-    END CATCH
-END;
-
-IF OBJECT_ID('dbo.empupload', 'U') IS NOT NULL
-BEGIN
-    BEGIN TRY
-        INSERT @Stages (Seq, Stage, Amount)
-        SELECT 2, N'Salary adjustment', u.salnew
-        FROM dbo.EmployeeDetail d
-        JOIN dbo.empupload u ON u.empid = d.EmployeeId
-        WHERE d.UserId = @UserId AND u.salnew IS NOT NULL;
-    END TRY
-    BEGIN CATCH
-    END CATCH
-END;
-
-INSERT @Stages (Seq, Stage, Amount)
-SELECT 3, N'Current salary', d.Salary
-FROM dbo.EmployeeDetail d
-WHERE d.UserId = @UserId AND d.Salary IS NOT NULL;
-
-SELECT  Stage,
-        Amount,
-        ChangeFromPrevious = Amount - LAG(Amount) OVER (ORDER BY Seq, Amount),
-        ChangePct          = CAST(100.0 * (Amount - LAG(Amount) OVER (ORDER BY Seq, Amount))
-                                  / NULLIF(LAG(Amount) OVER (ORDER BY Seq, Amount), 0) AS decimal(9, 1)),
-        IsCurrent          = CASE WHEN Seq = 3 THEN 1 ELSE 0 END
-FROM @Stages
-ORDER BY Seq, Amount;
-
-/* 5  RECORD HISTORY - every create / edit of this person's EmployeeDetail row.
+/* 4  RECORD HISTORY - every create / edit of this person's EmployeeDetail row.
       ActivityLog.UserName is the HR officer; the employee is named inside
       Activity, so the match is on the exact phrase. Skipped (empty) rather
       than failing the whole profile if the log cannot be read.  */
@@ -321,8 +278,7 @@ export const loadEmployeeProfile = async (pool, login) => {
         education: tidySet(sets[1]),
         training: tidySet(sets[2]),
         jobs: tidySet(sets[3]),
-        salary: tidySet(sets[4]),
-        history: tidySet(sets[5]),
+        history: tidySet(sets[4]),
     };
 };
 
